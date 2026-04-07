@@ -1,0 +1,86 @@
+# === Thesis Project GitIgnore ===
+
+# vcpkg
+vcpkg_installed/
+vcpkg-configuration.json
+
+# Visual Studio / MSVC
+.vs/
+out/
+build/
+bin/
+x64/
+x86/
+[Dd]ebug/
+[Rr]elease/
+*.vcxproj.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.ilk
+*.aps
+
+# NSIGHT profiler
+NSIGHT/
+
+# Scripts — keep Python scripts, ignore generated output
+# Scripts output
+scripts/output/*
+!scripts/output/.gitkeep
+scripts/cache/
+
+# Deep learning model files
+*.onnx
+*.pt
+*.pth
+*.bin
+*.h5
+*.ndld-proj
+models/
+
+# Compiled binaries and build artifacts
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.so
+*.dylib
+*.exe
+*.exp
+*.pdb
+
+# Audio and data files
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.npy
+*.npz
+
+# Libraries — get via vcpkg or official releases
+# Exception: Helios SDK is committed because it's source code
+# with no vcpkg package
+libs/
+!libs/helios/
+!libs/helios/**
+
+# TD backups
+TD/Backup/
+
+# Misc
+DirectoryList.txt
+
+# Temporary and OS
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python
+__pycache__/
+venv/
+env/
