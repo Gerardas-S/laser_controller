@@ -1,0 +1,104 @@
+Music Pipeline — Integration Guide
+====================================
+
+All new files are already in the project and vcxproj.
+When you're ready to wire the music pipeline into laser_controller.cpp,
+add the following snippets at the indicated locations.
+
+----------------------------------------------------------------------
+1. INCLUDES  (near top of laser_controller.cpp)
+----------------------------------------------------------------------
+
+    #include "MusicPipeline.h"
+
+
+----------------------------------------------------------------------
+2. GLOBAL  (after existing globals)
+----------------------------------------------------------------------
+
+    MusicPipeline g_music;
+    // g_music is started/stopped via console commands.
+
+
+----------------------------------------------------------------------
+3. INITIALIZATION  (inside main(), after laser / HeliosOutput init)
+----------------------------------------------------------------------
+
+    // Initialize music pipeline (loads CREPE if available)
+    g_music.Initialize(laser);          // laser is your HeliosOutput instance
+    // Or with explicit CREPE path:
+    // g_music.Initialize(laser, "models/crepe/model.onnx");
+
+
+----------------------------------------------------------------------
+4. COMMAND DISPATCH  (inside the command-reading loop in main())
+----------------------------------------------------------------------
+
+    // Add before the existing command checks:
+    if (g_music.HandleCommand(line)) continue;
+
+    // This handles:
+    //   music lissajous | torusknot | spectrum | spiral | rose |
+    //          hypotrochoid | pulsar | waveform | terrain |
+    //          melody | chroma
+    //   music stop | start | list
+    //   music rotate | norotate | scale | noscale | hue | nohue |
+    //          breathe | nobreathe
+    //   music pitch   (print current CREPE pitch estimate)
+
+
+----------------------------------------------------------------------
+5. CLEANUP  (before program exit or after quit command)
+----------------------------------------------------------------------
+
+    g_music.Stop();
+
+
+----------------------------------------------------------------------
+NOTES
+----------------------------------------------------------------------
+
+• The music pipeline runs on its own thread — it does NOT block the
+  main loop or the video pipeline.
+
+• Both pipelines share the same HeliosOutput (laser) instance.
+  They are mutually exclusive by convention: the active one calls
+  laser.SendFrame(), the inactive one does nothing.
+  A simple flag or mode enum in main() can select which is live.
+
+• melody / chroma modes require CREPE:
+      python scripts/export_music_models.py --model full --verify
+  The "tiny" model (~400 KB) runs in ~3 ms on CPU and is fine for live use.
+  "full" (~22 MB) gives the most accurate pitch but needs ~45 ms (use GPU).
+
+• All 11 geometry modes work without CREPE (pitch fields default to 0).
+  melody falls back gracefully to a simple Lissajous at the base ratio.
+  chroma falls back to a uniform 12-pointed star.
+
+----------------------------------------------------------------------
+QUICK-START (no laser connected — debug output only)
+----------------------------------------------------------------------
+
+    music lissajous
+    music torusknot
+    music spectrum
+    music melody     <- needs models/crepe/model.onnx
+    music chroma     <- same
+    music pitch      <- prints current pitch Hz + confidence
+    music list       <- shows all modes
+    music stop
+    music start
+
+----------------------------------------------------------------------
+FILE INVENTORY (music pipeline)
+----------------------------------------------------------------------
+
+  GeometryPoint3D.h        — GeometryPoint3D, Polyline3D, Frame3D, Frame3DToLaser()
+  AudioFeatures.h          — POD struct with all real-time audio analysis fields
+  AudioAnalyzer.h/.cpp     — PortAudio capture + FFT + mel + chroma + beat detection
+  GeometryShapes.h         — header-only geometry primitives (Lissajous, TorusKnot, …)
+  MusicGeometryEngine.h/.cpp — 11 geometry modes driven by AudioFeatures
+  BeatSyncEngine.h/.cpp    — post-process: scale pulse, rotation, Z breathe, hue shift
+  PitchAnalyzer.h/.cpp     — CREPE ONNX wrapper, feeds feat.pitch / feat.pitchNorm
+  MusicPipeline.h/.cpp     — top-level orchestrator, console command handler
+  scripts/export_music_models.py — exports CREPE (+ optional PESTO) to ONNX
