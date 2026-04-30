@@ -23,6 +23,8 @@ bool HEDInference::Initialize(Backend backend)
         env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "HEDInference");
         sessionOptions_ = std::make_unique<Ort::SessionOptions>();
 
+        sessionOptions_->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
         if (backend_ == Backend::GPU) {
             std::cout << "[HED] Initializing with GPU (CUDA) backend\n";
             OrtCUDAProviderOptions cuda{};
@@ -31,7 +33,6 @@ bool HEDInference::Initialize(Backend backend)
         } else {
             std::cout << "[HED] Initializing with CPU backend\n";
             sessionOptions_->SetIntraOpNumThreads(4);
-            sessionOptions_->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         }
         return true;
     } catch (const Ort::Exception& e) {
@@ -73,8 +74,14 @@ bool HEDInference::LoadModel(const std::wstring& modelPath)
             std::cout << "  [" << i << "] " << outputNames_.back() << "\n";
         }
 
+        // Print which execution providers actually loaded
+        auto providers = Ort::GetAvailableProviders();
+        std::cout << "[HED] Available providers: ";
+        for (auto& p : providers) std::cout << p << " ";
+        std::cout << "\n";
+
         isLoaded_ = true;
-        std::cout << "[HED] Model loaded OK\n";
+        std::cout << "[HED] Model loaded OK on " << GetBackendName() << "\n";
         return true;
     } catch (const Ort::Exception& e) {
         std::cerr << "[HED] LoadModel failed: " << e.what() << "\n";
@@ -98,12 +105,23 @@ std::vector<std::vector<LaserPoint>> HEDInference::ProcessFrame(
     float edgeThreshold,
     int   minContourPoints,
     float smoothEpsilon,
-    bool  sampleColor)
+    bool  sampleColor,
+    float temporalAlpha)
 {
     if (!isLoaded_ || bgrFrame.empty()) return {};
 
     cv::Mat edgeMap = RunInference(bgrFrame);
     if (edgeMap.empty()) return {};
+
+    // Temporal blending: mix current edge map with previous frame's.
+    if (temporalAlpha < 1.0f && !prevEdgeMap_.empty() &&
+        prevEdgeMap_.size() == edgeMap.size())
+    {
+        cv::addWeighted(edgeMap, temporalAlpha,
+                        prevEdgeMap_, 1.0f - temporalAlpha,
+                        0.0f, edgeMap);
+    }
+    prevEdgeMap_ = edgeMap.clone();
 
     return ExtractContours(edgeMap, bgrFrame, edgeThreshold,
                            minContourPoints, smoothEpsilon, sampleColor);

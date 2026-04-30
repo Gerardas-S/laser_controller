@@ -22,6 +22,14 @@ HeliosOutput::~HeliosOutput() {
 bool HeliosOutput::Initialize(HeliosConfig config)
 {
     config_ = config;
+    running_ = true;
+    dacThread_ = std::thread(&HeliosOutput::DacThreadFunc, this);
+    return Connect();
+}
+
+bool HeliosOutput::Connect()
+{
+    if (connected_) return true;
     int count = helios_.OpenDevices();
     if (count < 1) {
         std::cerr << "HeliosOutput: No DAC found\n";
@@ -29,9 +37,14 @@ bool HeliosOutput::Initialize(HeliosConfig config)
     }
     std::cout << "HeliosOutput: Found " << count << " DAC(s)\n";
     connected_ = true;
-    running_ = true;
-    dacThread_ = std::thread(&HeliosOutput::DacThreadFunc, this);
     return true;
+}
+
+void HeliosOutput::Disconnect()
+{
+    connected_ = false;
+    helios_.CloseDevices();
+    std::cout << "HeliosOutput: DAC disconnected\n";
 }
 
 void HeliosOutput::SetConfig(const HeliosConfig& config) {
@@ -44,10 +57,8 @@ void HeliosOutput::Close()
     queueCV_.notify_all();
     if (dacThread_.joinable())
         dacThread_.join();
-    if (connected_) {
-        helios_.CloseDevices();
-        connected_ = false;
-    }
+    if (connected_)
+        Disconnect();
 }
 
 bool HeliosOutput::IsConnected() const {
@@ -61,7 +72,7 @@ void HeliosOutput::SendPolyline(const std::vector<LaserPoint>& points)
 
 void HeliosOutput::SendFrame(const std::vector<std::vector<LaserPoint>>& polylines)
 {
-    if (polylines.empty()) return;
+    if (!connected_ || polylines.empty()) return;
 
     // Scale to ILDA
     std::vector<std::vector<HeliosPoint>> scaled;
@@ -159,10 +170,15 @@ std::vector<HeliosPoint> HeliosOutput::BuildFrame(
     std::vector<HeliosPoint> frame;
     frame.reserve(512);
 
-    // Start position — center of ILDA space
+    // Start from where the galvo actually is (tracked by DacThreadFunc).
+    // On the very first frame this is the centre (2048, 2048).  On every
+    // subsequent frame it is the last point of the previously sent frame,
+    // so repeated frames (e.g. the alignment circle) produce zero travel
+    // overhead at the join — eliminating the per-frame lurch that caused
+    // galvo chirping at the frame repeat boundary.
     HeliosPoint currentPos{};
-    currentPos.x = 2048;
-    currentPos.y = 2048;
+    currentPos.x = (uint16_t)lastEndX_.load(std::memory_order_relaxed);
+    currentPos.y = (uint16_t)lastEndY_.load(std::memory_order_relaxed);
     currentPos.r = currentPos.g = currentPos.b = currentPos.i = 0;
 
     for (size_t pi = 0; pi < polylines.size(); ++pi)
@@ -459,41 +475,43 @@ void HeliosOutput::DacThreadFunc()
 
     while (running_)
     {
+        // If not connected, wait — don't spin on USB errors.
+        if (!connected_) {
+            // Drain stale queue so we don't play old frames on reconnect.
+            { std::lock_guard<std::mutex> lk(queueMutex_);
+              while (!frameQueue_.empty()) frameQueue_.pop(); }
+            currentFrame.clear();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        // Poll until DAC is ready.
+        int status = helios_.GetStatus(0);
+        if (status < 0) {
+            std::cerr << "HeliosOutput: DAC error " << status << " — going offline\n";
+            connected_ = false;
+            continue;
+        }
+        if (status != 1) continue; // not ready yet, poll again
+
+        // Grab latest frame (re-send last if nothing new)
         {
-            std::unique_lock<std::mutex> lock(queueMutex_);
-            queueCV_.wait(lock, [this] {
-                return !frameQueue_.empty() || !running_;
-                });
-            if (!running_) break;
-            currentFrame = std::move(frameQueue_.front());
-            frameQueue_.pop();
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (!frameQueue_.empty()) {
+                currentFrame = std::move(frameQueue_.front());
+                frameQueue_.pop();
+            }
         }
 
         if (currentFrame.empty()) continue;
 
-        int pps = CalculatePPS((int)currentFrame.size());
-        int attempts = 0;
+        // Record where the galvo will be after this frame completes so the
+        // next BuildFrame call can start its travel from the right position.
+        lastEndX_.store((int)currentFrame.back().x, std::memory_order_relaxed);
+        lastEndY_.store((int)currentFrame.back().y, std::memory_order_relaxed);
 
-        while (running_) {
-            int status = helios_.GetStatus(0);
-            if (status == 1) {
-                int result = helios_.WriteFrame(
-                    0, pps, HELIOS_FLAGS_DEFAULT,
-                    currentFrame.data(),
-                    (uint32_t)currentFrame.size()
-                );
-                if (result == HELIOS_SUCCESS) break;
-                if (++attempts > 10) {
-                    std::cerr << "HeliosOutput: WriteFrame failed after 10 attempts\n";
-                    break;
-                }
-            }
-            else if (status < 0) {
-                std::cerr << "HeliosOutput: DAC error " << status << "\n";
-                connected_ = false;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
+        int pps = CalculatePPS((int)currentFrame.size());
+        helios_.WriteFrame(0, pps, HELIOS_FLAGS_SINGLE_MODE,
+                           currentFrame.data(), (uint32_t)currentFrame.size());
     }
 }

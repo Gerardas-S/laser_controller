@@ -5,6 +5,7 @@
 #include <mutex>
 #include <queue>
 #include <condition_variable>
+#include <atomic>
 #include <cstdint>
 #include "libs/helios/HeliosDac.h"
 
@@ -47,8 +48,17 @@ public:
     HeliosOutput();
     ~HeliosOutput();
 
+    // Start the DAC thread with the given config. Does not require a DAC to be
+    // present — returns false if no DAC found but the program can keep running.
     bool Initialize(HeliosConfig config = {});
     void Close();
+
+    // Attempt to open DAC devices. Safe to call while running.
+    bool Connect();
+
+    // Close DAC devices. Output silently stops; Connect() can re-open later.
+    void Disconnect();
+
     bool IsConnected() const;
     void SetConfig(const HeliosConfig& config);
 
@@ -98,6 +108,14 @@ private:
     HeliosConfig config_;
     bool         running_ = false;
     bool         connected_ = false;
+
+    // Last known galvo position (ILDA coords 0-4095).
+    // Updated by DacThreadFunc after each frame is sent so BuildFrame can
+    // begin its travel calculation from where the galvo actually is rather
+    // than always assuming it starts at the centre.  Using atomics means no
+    // additional locking is required in BuildFrame.
+    std::atomic<int> lastEndX_{ 2048 };
+    std::atomic<int> lastEndY_{ 2048 };
 
     // --- threading ---
     std::thread                          dacThread_;

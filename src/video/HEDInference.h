@@ -64,6 +64,8 @@ private:
     std::vector<const char*> inputNames_;
     std::vector<const char*> outputNames_;
 
+    cv::Mat prevEdgeMap_;  // for temporal blending
+
     Backend backend_  = Backend::CPU;
     bool    isLoaded_ = false;
 
