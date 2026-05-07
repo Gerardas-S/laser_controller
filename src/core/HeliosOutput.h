@@ -35,8 +35,28 @@ struct HeliosConfig {
     float max_point_distance = 50.0f;  // kept for SendPointCloud gap detection
     int   min_vertex_hold = 2;
     int   max_vertex_hold = 20;
-    float curve_threshold = 20.0f;
+    float curve_threshold = 20.0f;     // degrees — bends below this get zero dwell
     bool  enable_reorder = false;
+
+    // ── Phase 1 optimisations ────────────────────────────────────────────────
+
+    // Menger-curvature dwell scale.
+    // CalcCornerDwell computes κ = 2·|cross| / (|AB|·|BC|·|AC|) (ILDA units⁻¹)
+    // then dwell = κ × kappa_scale, clamped to [min_vertex_hold, max_vertex_hold].
+    // Increase to dwell longer at sharp corners; decrease to tighten timing.
+    float kappa_scale = 500.0f;
+
+    // Angle penalty weight for TSP path reorder (ILDA units per radian ×2).
+    // A blank-travel that requires a 180° galvo direction reversal costs an
+    // extra  reorder_angle_weight  ILDA units on top of its Euclidean distance.
+    // Only active when enable_reorder = true.
+    float reorder_angle_weight = 100.0f;
+
+    // Y-axis phase correction (fractional sample count, typically 0.0–1.0).
+    // The Y galvo servo often lags X by a fraction of a point interval; this
+    // advances Y by xy_phase_shift samples via linear interpolation so that
+    // diagonal lines remain straight.  Set to 0 to disable.
+    float xy_phase_shift = 0.0f;
 };
 
 // -----------------------------------------------------------------------------
@@ -62,7 +82,10 @@ public:
     bool IsConnected() const;
     void SetConfig(const HeliosConfig& config);
 
-    // 1. You know your structure — multiple explicit polylines
+    // 1. You know your structure — multiple explicit polylines.
+    //    Runtime-generated content (alignment circle, etc.) goes through here:
+    //    HeliosOutput synthesises blanking, dwells, and eased travel via
+    //    BuildFrame.  Use this when you DON'T have a pre-baked .ild file.
     void SendFrame(const std::vector<std::vector<LaserPoint>>& polylines);
 
     // 2. You have one continuous stroke
@@ -70,6 +93,13 @@ public:
 
     // 3. You have a flat bag of points with no structure
     void SendPointCloud(const std::vector<LaserPoint>& points, float gapThreshold = 0.1f);
+
+    // 4. You already have a physically-baked point sequence (12-bit ILDA
+    //    coords, blanking and dwells already inserted at encode time).
+    //    Used for .ild files produced by encode.py.  Goes straight into the
+    //    DAC queue with no further geometric processing — only hardware
+    //    compensation (xy_phase_shift) is applied in DacThreadFunc.
+    void SendPhysical(const std::vector<HeliosPoint>& points);
 
 private:
     // --- coordinate conversion ---
@@ -99,6 +129,7 @@ private:
     float PolylineLength(const std::vector<HeliosPoint>& poly);
     int   EstimateTransitionCost(HeliosPoint from, HeliosPoint to);
     int   CalcCornerDwell(HeliosPoint a, HeliosPoint b, HeliosPoint c);
+    void  ApplyPhaseCorrection(std::vector<HeliosPoint>& frame);
 
     // --- DAC thread ---
     void DacThreadFunc();

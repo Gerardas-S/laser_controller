@@ -1,4 +1,3 @@
-#define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <iostream>
@@ -14,8 +13,6 @@
 #include <numeric>
 #include <cstdio>
 #include "HeliosOutput.h"
-#include "HEDInference.h"
-#include "DepthInference.h"
 #include "ILDAFile.h"
 #include <opencv2/videoio.hpp>
 #include <opencv2/core/utils/logger.hpp>
@@ -69,73 +66,73 @@ static std::pair<float,float> Centroid(const std::vector<LaserPoint>& poly)
 //   flipping each contour. Minimises galvo travel without sacrificing
 //   the temporal stability gained in step 1.
 
-Frame ReorderFrame(const Frame& frame)
-{
-    if (frame.size() <= 1) return frame;
-
-    // Step 1: sort by centroid Y (primary) then X (secondary)
-    // Quantise Y into coarse rows (~10% of screen height) so small
-    // vertical jitter between frames doesn't constantly re-sort contours.
-    const float kRowHeight = 0.1f;
-    std::vector<int> idx(frame.size());
-    std::iota(idx.begin(), idx.end(), 0);
-    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
-        auto [ax, ay] = Centroid(frame[a]);
-        auto [bx, by] = Centroid(frame[b]);
-        int rowA = static_cast<int>((ay + 1.0f) / kRowHeight);
-        int rowB = static_cast<int>((by + 1.0f) / kRowHeight);
-        if (rowA != rowB) return rowA < rowB;
-        return ax < bx;
-    });
-
-    // Step 2: nearest-neighbour with flip, preserving the sorted order
-    // as a strong prior (only swap adjacent pairs that are clearly better)
-    Frame sorted;
-    sorted.reserve(frame.size());
-    for (int i : idx) sorted.push_back(frame[i]);
-
-    Frame result;
-    result.reserve(sorted.size());
-    std::vector<bool> visited(sorted.size(), false);
-
-    // Start from first in spatial order
-    visited[0] = true;
-    result.push_back(sorted[0]);
-
-    for (size_t step = 1; step < sorted.size(); ++step) {
-        const LaserPoint& tail = result.back().back();
-        float bestDist = std::numeric_limits<float>::max();
-        int   bestIdx  = -1;
-        bool  bestFlip = false;
-
-        for (int j = 0; j < (int)sorted.size(); ++j) {
-            if (visited[j] || sorted[j].empty()) continue;
-            float dx, dy, d;
-
-            dx = sorted[j].front().x - tail.x;
-            dy = sorted[j].front().y - tail.y;
-            d  = dx*dx + dy*dy;
-            if (d < bestDist) { bestDist = d; bestIdx = j; bestFlip = false; }
-
-            dx = sorted[j].back().x - tail.x;
-            dy = sorted[j].back().y - tail.y;
-            d  = dx*dx + dy*dy;
-            if (d < bestDist) { bestDist = d; bestIdx = j; bestFlip = true; }
-        }
-
-        if (bestIdx < 0) break;
-        visited[bestIdx] = true;
-
-        if (bestFlip) {
-            auto flipped = sorted[bestIdx];
-            std::reverse(flipped.begin(), flipped.end());
-            result.push_back(std::move(flipped));
-        } else {
-            result.push_back(sorted[bestIdx]);
-        }
-    }
-    return result;
-}
+//Frame ReorderFrame(const Frame& frame)
+//{
+//    if (frame.size() <= 1) return frame;
+//
+//    // Step 1: sort by centroid Y (primary) then X (secondary)
+//    // Quantise Y into coarse rows (~10% of screen height) so small
+//    // vertical jitter between frames doesn't constantly re-sort contours.
+//    const float kRowHeight = 0.1f;
+//    std::vector<int> idx(frame.size());
+//    std::iota(idx.begin(), idx.end(), 0);
+//    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
+//        auto [ax, ay] = Centroid(frame[a]);
+//        auto [bx, by] = Centroid(frame[b]);
+//        int rowA = static_cast<int>((ay + 1.0f) / kRowHeight);
+//        int rowB = static_cast<int>((by + 1.0f) / kRowHeight);
+//        if (rowA != rowB) return rowA < rowB;
+//        return ax < bx;
+//    });
+//
+//    // Step 2: nearest-neighbour with flip, preserving the sorted order
+//    // as a strong prior (only swap adjacent pairs that are clearly better)
+//    Frame sorted;
+//    sorted.reserve(frame.size());
+//    for (int i : idx) sorted.push_back(frame[i]);
+//
+//    Frame result;
+//    result.reserve(sorted.size());
+//    std::vector<bool> visited(sorted.size(), false);
+//
+//    // Start from first in spatial order
+//    visited[0] = true;
+//    result.push_back(sorted[0]);
+//
+//    for (size_t step = 1; step < sorted.size(); ++step) {
+//        const LaserPoint& tail = result.back().back();
+//        float bestDist = std::numeric_limits<float>::max();
+//        int   bestIdx  = -1;
+//        bool  bestFlip = false;
+//
+//        for (int j = 0; j < (int)sorted.size(); ++j) {
+//            if (visited[j] || sorted[j].empty()) continue;
+//            float dx, dy, d;
+//
+//            dx = sorted[j].front().x - tail.x;
+//            dy = sorted[j].front().y - tail.y;
+//            d  = dx*dx + dy*dy;
+//            if (d < bestDist) { bestDist = d; bestIdx = j; bestFlip = false; }
+//
+//            dx = sorted[j].back().x - tail.x;
+//            dy = sorted[j].back().y - tail.y;
+//            d  = dx*dx + dy*dy;
+//            if (d < bestDist) { bestDist = d; bestIdx = j; bestFlip = true; }
+//        }
+//
+//        if (bestIdx < 0) break;
+//        visited[bestIdx] = true;
+//
+//        if (bestFlip) {
+//            auto flipped = sorted[bestIdx];
+//            std::reverse(flipped.begin(), flipped.end());
+//            result.push_back(std::move(flipped));
+//        } else {
+//            result.push_back(sorted[bestIdx]);
+//        }
+//    }
+//    return result;
+//}
 
 // -----------------------------------------------------------------------------
 // Alignment circle
@@ -187,19 +184,29 @@ std::atomic<bool> g_configDirty{ false };
 HeliosConfig g_config;
 std::mutex   g_configMutex;
 
-std::unique_ptr<HEDInference>   g_hed;
-std::unique_ptr<DepthInference> g_depth;
-
+// Logical polyline animation buffer — kept for runtime-generated content
+// (alignment circle).  Played via HeliosOutput::SendFrame which synthesises
+// blanking/dwells live.  In-process direct-inference paths were removed;
+// the SAM2 pipeline (segment → vectorize → encode) is the sole
+// source of video-derived ILDA files.
 std::vector<Frame>  g_videoAnimation;
+
+// Physically-baked animation from encode.py — every point in the buffer is a
+// point the DAC will play, in 12-bit ILDA coords.  Played via SendPhysical.
+std::vector<std::vector<HeliosPoint>> g_videoAnimationPhysical;
+
 std::mutex          g_animationMutex;
 std::atomic<bool>   g_videoProcessing{ false };
 std::atomic<bool>   g_videoReady{ false };
+std::atomic<bool>   g_videoBaked{ false };   // which buffer is active
 std::string         g_nowPlaying = "alignment circle";
+float               g_animationScale = 1.0f;
+float               g_animationBrightness = 1.0f;
 
 std::thread g_videoThread;
 
-enum class VideoMode { HED, DEPTH, SAM2, SAM2_CANNY, SAM2_HED, SAM2_DEPTH, SAM2_SEG, SAM2_THIN, SAM2_ALL };
-VideoMode g_videoMode = VideoMode::HED;
+enum class VideoMode { SAM2, SAM2_CANNY, SAM2_HED, SAM2_SEG, SAM2_ALL };
+VideoMode g_videoMode = VideoMode::SAM2;
 
 // -----------------------------------------------------------------------------
 // Video thread
@@ -224,15 +231,7 @@ void VideoThread(std::string videoPath, VideoMode mode)
     //    resources/polylines/   {stem}_sam2-{model}_{method}.json
     //    resources/animations/  {stem}_sam2-{model}_{method}.ild
     // -------------------------------------------------------------------------
-    bool isSam2 = (mode == VideoMode::SAM2       ||
-                   mode == VideoMode::SAM2_CANNY  ||
-                   mode == VideoMode::SAM2_HED    ||
-                   mode == VideoMode::SAM2_DEPTH  ||
-                   mode == VideoMode::SAM2_SEG    ||
-                   mode == VideoMode::SAM2_THIN   ||
-                   mode == VideoMode::SAM2_ALL);
-
-    if (isSam2) {
+    {
         // --- Path setup ---
         const std::string kModel    = "tiny";   // SAM2 model size (change here to upgrade)
         const std::string kDevice   = "cuda";
@@ -252,9 +251,6 @@ void VideoThread(std::string videoPath, VideoMode mode)
         fs::path vecScript = kProjectDir / "scripts" / "vectorize.py";
         fs::path encScript = kProjectDir / "scripts" / "encode.py";
         fs::path ckptDir   = kProjectDir / "models"  / "sam2";
-        fs::path hedModel  = kProjectDir / "models"  / "hed"   / "model.onnx";
-        fs::path depthModel= kProjectDir / "models"  / "depth" / "model.onnx";
-
         fs::path masksPath  = masksDir / (maskTag + ".npz");
 
         // Map VideoMode → interior method name used in filenames and --method arg
@@ -262,8 +258,6 @@ void VideoThread(std::string videoPath, VideoMode mode)
             switch (mode) {
                 case VideoMode::SAM2_CANNY: return "canny";
                 case VideoMode::SAM2_HED:   return "hed";
-                case VideoMode::SAM2_DEPTH: return "depth";
-                case VideoMode::SAM2_THIN:  return "thin";
                 case VideoMode::SAM2_SEG:   return "seg";
                 default:                    return "all";   // SAM2, SAM2_ALL
             }
@@ -271,28 +265,48 @@ void VideoThread(std::string videoPath, VideoMode mode)
         const std::string method = ModeMethod();
 
         // --- Generic script runner: launches subprocess, streams stdout, returns success ---
-        auto RunScript = [&](const std::string& label,
-                             const std::string& cmd) -> bool
+        auto RunScript = [&](const std::string& label, const std::string& cmd) -> bool
         {
-            std::cout << '\n' << label << '\n' << std::flush;
-            // Wrap in outer quotes: cmd.exe /c strips one layer of surrounding
-            // quotes when the argument begins with ", so we add one extra pair.
-            std::string wrapped = "\"" + cmd + " 2>&1\"";
-            FILE* pipe = _popen(wrapped.c_str(), "r");
-            if (!pipe) {
-                std::cerr << label << " Failed to launch subprocess\n";
-                return false;
-            }
-            char buf[512];
-            while (fgets(buf, sizeof(buf), pipe))
-                std::cout << buf << std::flush;
-            int ret = _pclose(pipe);
-            if (ret != 0) {
-                std::cerr << label << " Script exited with code " << ret << '\n';
-                return false;
-            }
-            return true;
+                std::cout << '\n' << label << '\n' << std::flush;
+
+                // Torch native libs shipped inside the venv (ensure this path exists)
+                std::string torchLib = (kProjectDir / ".venv" / "Lib" / "site-packages" / "torch" / "lib").generic_string();
+
+                // Save current PATH and set a new PATH with torchLib prefixed
+                char* oldPathC = nullptr;
+                size_t oldPathLen = 0;
+                _dupenv_s(&oldPathC, &oldPathLen, "PATH");
+                std::string oldPath = oldPathC ? oldPathC : "";
+                free(oldPathC);
+                std::string newPath = torchLib + ";" + oldPath;
+                SetEnvironmentVariableA("PATH", newPath.c_str());
+
+                // Run the command via shell and stream output
+                // Keep the same quoting behavior you used before for cmd
+                std::string wrapped = "\"" + cmd + " 2>&1\"";
+                FILE* pipe = _popen(wrapped.c_str(), "r");
+                if (!pipe) {
+                    std::cerr << label << " Failed to launch subprocess\n";
+                    // restore PATH before returning
+                    SetEnvironmentVariableA("PATH", oldPath.c_str());
+                    return false;
+                }
+
+                char buf[512];
+                while (fgets(buf, sizeof(buf), pipe))
+                    std::cout << buf << std::flush;
+
+                int ret = _pclose(pipe);
+
+                // Restore original PATH
+                SetEnvironmentVariableA("PATH", oldPath.c_str());
+
+                if (ret != 0) {
+                    std::cerr << label << " Script exited with code " << ret << '\n';
+                }
+                return ret == 0;
         };
+
 
         // ── Stage 1: Segment ─────────────────────────────────────────────────
         // Skip if masks file already exists (cache).
@@ -326,8 +340,6 @@ void VideoThread(std::string videoPath, VideoMode mode)
                 " --masks \""        + masksPath.string()    + "\""
                 " --output \""       + vecBasePath.string()  + "\""
                 " --method "         + method                +
-                " --hed-model \""    + hedModel.string()     + "\""
-                " --depth-model \""  + depthModel.string()   + "\""
                 " --device "         + kDevice;
             if (!RunScript("[vectorize]", cmd)) {
                 g_videoProcessing = false; return;
@@ -339,7 +351,7 @@ void VideoThread(std::string videoPath, VideoMode mode)
         // ── Stage 3: Encode ───────────────────────────────────────────────────
         // For 'all' mode, run encode.py once per method JSON.
         // For single methods, run once.
-        static const std::vector<std::string> kAllMethods = {"canny","hed","depth","thin","depth_iso","flow","hatch","lum_iso"};
+        static const std::vector<std::string> kAllMethods = {"canny","hed"};
         const std::vector<std::string> encMethods =
             (method == "all") ? kAllMethods : std::vector<std::string>{method};
 
@@ -364,21 +376,23 @@ void VideoThread(std::string videoPath, VideoMode mode)
         if (!g_videoProcessing) return;
 
         // ── Load and play ─────────────────────────────────────────────────────
-        // Priority order for 'all' mode: hed > thin > canny > depth
-        static const std::vector<std::string> kPlayPriority = {"hed","thin","canny","depth"};
+        // Priority order for 'all' mode: hed > canny
+        static const std::vector<std::string> kPlayPriority = {"hed","canny"};
         const std::vector<std::string>& candidates =
             (method == "all") ? kPlayPriority : encMethods;
 
-        std::vector<Frame> finalAnim;
+        std::vector<std::vector<HeliosPoint>> finalAnim;   // physically baked
         std::string        finalName;
+        fs::path           finalPath;
 
         for (const auto& m : candidates) {
             fs::path animPath = animsDir / (maskTag + "_" + m + ".ild");
             if (!fs::exists(animPath)) continue;
-            auto anim = ILDAFile::Load(animPath.string());
+            auto anim = ILDAFile::LoadFlat(animPath.string());
             if (!anim.empty()) {
                 finalAnim = std::move(anim);
                 finalName = animPath.filename().string();
+                finalPath = animPath;
                 break;
             }
         }
@@ -391,7 +405,9 @@ void VideoThread(std::string videoPath, VideoMode mode)
 
         {
             std::lock_guard<std::mutex> lock(g_animationMutex);
-            g_videoAnimation = std::move(finalAnim);
+            g_videoAnimationPhysical = std::move(finalAnim);
+            g_videoAnimation.clear();
+            g_videoBaked = true;
         }
         g_nowPlaying      = finalName;
         g_videoProcessing = false;
@@ -399,106 +415,13 @@ void VideoThread(std::string videoPath, VideoMode mode)
         g_sceneIndex      = 7;
 
         if (method == "all")
-            std::cout << "\n[sam2-all] Done — 4 ILDs in resources/animations/  "
+            std::cout << "\n[sam2-all] Done — 2 ILDs in resources/animations/  "
                          "type 'load' to switch between them.\n> " << std::flush;
         else
             std::cout << "[sam2] Playing " << finalName << "\n> " << std::flush;
         return;
     }
 
-    // -------------------------------------------------------------------------
-    // DEPTH — Depth Anything V2 in-process inference (edges + isolines)
-    // -------------------------------------------------------------------------
-    if (mode == VideoMode::DEPTH) {
-        cv::VideoCapture cap(videoPath);
-        if (!cap.isOpened()) {
-            std::cerr << "[depth] Failed to open: " << videoPath << "\n";
-            g_videoProcessing = false;
-            return;
-        }
-
-        int total = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
-        std::cout << "[depth] Opened (" << total << " frames) — processing...\n";
-
-        std::vector<Frame> animation;
-        animation.reserve(total > 0 ? total : 256);
-
-        int fi = 0;
-        while (g_running && g_videoProcessing) {
-            cv::Mat frame;
-            if (!cap.read(frame)) break;
-
-            Frame lf;
-            if (g_depth)
-                lf = g_depth->ProcessFrame(frame, DepthInference::Mode::Both);
-            if (!lf.empty()) animation.push_back(ReorderFrame(lf));
-
-            if (++fi % 10 == 0)
-                std::cout << "[depth] " << fi << " / " << total << "\r" << std::flush;
-        }
-
-        std::cout << "\n[depth] " << animation.size() << " frames done.\n";
-
-        fs::path ildPath = kResourcesDir /
-                           fs::path(videoPath).stem().concat("_depth.ild");
-        ILDAFile::Save(ildPath.string(), animation);
-
-        {
-            std::lock_guard<std::mutex> lock(g_animationMutex);
-            g_videoAnimation = std::move(animation);
-        }
-        g_nowPlaying      = ildPath.filename().string();
-        g_videoProcessing = false;
-        g_videoReady      = true;
-        g_sceneIndex      = 7;
-        std::cout << "[depth] Playing. Type 0 for circle or pick another file.\n> ";
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // HED — in-process frame-by-frame inference
-    // -------------------------------------------------------------------------
-    cv::VideoCapture cap(videoPath);
-    if (!cap.isOpened()) {
-        std::cerr << "[video] Failed to open: " << videoPath << "\n";
-        g_videoProcessing = false;
-        return;
-    }
-
-    int total = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
-    std::cout << "[video] Opened (" << total << " frames) — processing...\n";
-
-    std::vector<Frame> animation;
-    animation.reserve(total > 0 ? total : 256);
-
-    int fi = 0;
-    while (g_running && g_videoProcessing) {
-        cv::Mat frame;
-        if (!cap.read(frame)) break;
-
-        Frame lf;
-        if (g_hed) lf = g_hed->ProcessFrame(frame);
-        if (!lf.empty()) animation.push_back(ReorderFrame(lf));
-
-        if (++fi % 10 == 0)
-            std::cout << "[video] " << fi << " / " << total << "\r" << std::flush;
-    }
-
-    std::cout << "\n[video] " << animation.size() << " frames done.\n";
-
-    fs::path ildPath = kResourcesDir /
-                       fs::path(videoPath).stem().concat("_hed.ild");
-    ILDAFile::Save(ildPath.string(), animation);
-
-    {
-        std::lock_guard<std::mutex> lock(g_animationMutex);
-        g_videoAnimation = std::move(animation);
-    }
-    g_nowPlaying      = ildPath.filename().string();
-    g_videoProcessing = false;
-    g_videoReady      = true;
-    g_sceneIndex      = 7;
-    std::cout << "[video] Playing. Type 0 for circle or pick another file.\n> ";
 }
 
 // -----------------------------------------------------------------------------
@@ -528,16 +451,41 @@ void RenderThread(HeliosOutput& laser)
             if (elapsed >= frameDt) {
                 {
                     std::lock_guard<std::mutex> lock(g_animationMutex);
-                    int n = static_cast<int>(g_videoAnimation.size());
+                    int n = g_videoBaked
+                                ? static_cast<int>(g_videoAnimationPhysical.size())
+                                : static_cast<int>(g_videoAnimation.size());
                     if (n > 0) animFrame = (animFrame + 1) % n;
                 }
                 lastAdvance = now;
             }
 
             std::lock_guard<std::mutex> lock(g_animationMutex);
-            int n = static_cast<int>(g_videoAnimation.size());
-            if (n > 0) { laser.SendFrame(g_videoAnimation[animFrame % n]); }
-            else        { laser.SendFrame(alignCircle); }
+            if (g_videoBaked) {
+                int n = static_cast<int>(g_videoAnimationPhysical.size());
+                if (n > 0) {
+                    const auto& frame = g_videoAnimationPhysical[animFrame % n];
+                    if (g_animationScale != 1.0f) {
+                        std::vector<HeliosPoint> scaled = frame;
+                        for (auto& p : scaled) {
+                            //scale around center 2048, 2048
+                            float cx = 2048.0f, cy = 2048.0f;
+                            p.x = static_cast<uint16_t>(std::clamp(cx + (p.x - cx) * g_animationScale, 0.0f, 4095.0f));
+                            p.y = static_cast<uint16_t>(std::clamp(cy + (p.y - cy) * g_animationScale, 0.0f, 4095.0f));
+                        }
+                        laser.SendPhysical(scaled);
+                    }
+                    else {
+                        laser.SendPhysical(frame);
+                    }
+                }
+                else {
+                    laser.SendFrame(alignCircle);
+                }
+            } else {
+                int n = static_cast<int>(g_videoAnimation.size());
+                if (n > 0) laser.SendFrame(g_videoAnimation[animFrame % n]);
+                else       laser.SendFrame(alignCircle);
+            }
         } else {
             // Circle: processing in progress, or user selected circle
             if (g_sceneIndex == 7 && !g_videoReady)
@@ -598,12 +546,9 @@ void PrintMenu(const HeliosOutput& laser)
     std::cout << "  segment  <video> [prompt]        Stage 1: video -> masks  (cached)\n";
     std::cout << "  preview-masks <video>             View segmentation masks\n";
     std::cout << "  vectorize <video> <method>        Stage 2: masks -> polylines\n";
-    std::cout << "                                      method: canny | hed | depth | thin | depth_iso | flow | hatch | lum_iso\n";
+    std::cout << "                                      method: canny | hed | edter | diffusion_edge\n";
     std::cout << "  preview-polylines <video> <method> View vectorized paths\n";
     std::cout << "  encode   <video> <method>         Stage 3: polylines -> ILDA + play\n\n";
-    std::cout << "  --- Direct inference (in-process C++) ---\n";
-    std::cout << "  video hed   <path>                HED edge detection\n";
-    std::cout << "  video depth <path>                Depth Anything V2\n\n";
     std::cout << "  stop               back to circle\n";
     std::cout << "  set <param> <val>  tune laser params\n";
     std::cout << "  config             show current config\n";
@@ -675,7 +620,9 @@ int main()
             if (g_videoThread.joinable()) g_videoThread.join();
             g_videoReady = false;
             { std::lock_guard<std::mutex> lock(g_animationMutex);
-              g_videoAnimation.clear(); }
+              g_videoAnimation.clear();
+              g_videoAnimationPhysical.clear();
+              g_videoBaked = false; }
             g_sceneIndex  = 0;
             g_nowPlaying  = "alignment circle";
             std::cout << "Stopped.\n";
@@ -704,78 +651,40 @@ int main()
             }
 
             std::string path = files[idx - 1].string();
-            auto anim = ILDAFile::Load(path);
-            if (anim.empty()) {
-                std::cerr << "Failed to load: " << path << "\n";
-                PrintMenu(laser);
-                continue;
-            }
 
             if (g_videoThread.joinable()) {
                 g_videoProcessing = false;
                 g_videoReady      = false;
                 g_videoThread.join();
             }
-            {
+
+            // Auto-detect baked vs logical .ild and dispatch to the correct loader
+            bool baked = ILDAFile::IsBaked(path);
+            if (baked) {
+                auto anim = ILDAFile::LoadFlat(path);
+                if (anim.empty()) {
+                    std::cerr << "Failed to load (baked): " << path << "\n";
+                    PrintMenu(laser); continue;
+                }
                 std::lock_guard<std::mutex> lock(g_animationMutex);
-                g_videoAnimation = std::move(anim);
+                g_videoAnimationPhysical = std::move(anim);
+                g_videoAnimation.clear();
+                g_videoBaked = true;
+            } else {
+                auto anim = ILDAFile::Load(path);
+                if (anim.empty()) {
+                    std::cerr << "Failed to load (logical): " << path << "\n";
+                    PrintMenu(laser); continue;
+                }
+                std::lock_guard<std::mutex> lock(g_animationMutex);
+                g_videoAnimation         = std::move(anim);
+                g_videoAnimationPhysical.clear();
+                g_videoBaked             = false;
             }
+
             g_nowPlaying = files[idx - 1].filename().string();
             g_videoReady = true;
             g_sceneIndex = 7;
-            PrintMenu(laser);
-            continue;
-        }
-
-        // ── video hed / video depth  (in-process inference, unchanged) ────────
-        if (line.rfind("video ", 0) == 0) {
-            std::istringstream vss(line.substr(6));
-            std::string modeStr, path;
-            vss >> modeStr;
-            std::getline(vss, path);
-            if (!path.empty() && path.front() == ' ') path = path.substr(1);
-
-            if (modeStr != "hed" && modeStr != "depth") {
-                std::cerr << "Usage: video <hed|depth> <path>\n"
-                             "  For SAM2 pipeline use: segment / vectorize / encode\n";
-                PrintMenu(laser); continue;
-            }
-            if (path.empty()) {
-                std::cerr << "No path given.\n";
-                PrintMenu(laser); continue;
-            }
-
-            VideoMode mode = (modeStr == "depth") ? VideoMode::DEPTH : VideoMode::HED;
-
-            if (mode == VideoMode::HED && !g_hed) {
-                g_hed = std::make_unique<HEDInference>();
-                fs::path hedModel = kProjectDir / "models" / "hed" / "model.onnx";
-                if (!g_hed->Initialize(HEDInference::Backend::CPU) ||
-                    !g_hed->LoadModel(hedModel.wstring())) {
-                    std::cerr << "HED init failed\n";
-                    g_hed.reset(); PrintMenu(laser); continue;
-                }
-            }
-            if (mode == VideoMode::DEPTH && !g_depth) {
-                g_depth = std::make_unique<DepthInference>();
-                fs::path depthModel = kProjectDir / "models" / "depth" / "model.onnx";
-                if (!g_depth->Initialize(DepthInference::Backend::CPU) ||
-                    !g_depth->LoadModel(depthModel.wstring())) {
-                    std::cerr << "Depth init failed\n";
-                    g_depth.reset(); PrintMenu(laser); continue;
-                }
-            }
-
-            if (g_videoThread.joinable()) {
-                g_videoProcessing = false;
-                g_videoReady      = false;
-                g_videoThread.join();
-            }
-            g_videoMode   = mode;
-            g_sceneIndex  = 7;
-            g_nowPlaying  = "alignment circle";
-            g_videoThread = std::thread(VideoThread, path, mode);
-            std::cout << "Processing (" << modeStr << "): " << path << "\n";
             PrintMenu(laser);
             continue;
         }
@@ -842,8 +751,10 @@ int main()
             fs::path ckptDir    = kProjectDir / "models"  / "sam2";
             fs::path gdinoModel = kProjectDir / "models"  / "gdino" /
                                   "groundingdino_swint_ogc.pth";
-            fs::path hedModel   = kProjectDir / "models"  / "hed"   / "model.onnx";
-            fs::path depthModel = kProjectDir / "models"  / "depth" / "model.onnx";
+            fs::path edterModel      = kProjectDir / "models" / "edter"          / "EDTER-BSDS-VOC-StageI.pth";
+            fs::path diffEdgeModel   = kProjectDir / "models" / "diffusion_edge" / "bsds.pt";
+            fs::path diffEdgeStage1  = kProjectDir / "models" / "diffusion_edge" / "first_stage_total_320.pt";
+            fs::path diffEdgeConfig  = kProjectDir / "models" / "diffusion_edge" / "bsds_sample.yaml";
 
             // segment command
             std::string segCmd =
@@ -869,17 +780,19 @@ int main()
             fs::path polyAllOut = polyDir / (maskTag + ".json"); // script adds _method
 
             std::string vecCmd =
-                kPython + " \"" + vecScript.string()        + "\""
-                " --video \""        + videoPath             + "\""
-                " --masks \""        + masksPath.string()    + "\""
-                " --output \""       + polyAllOut.string()   + "\""
+                kPython + " \"" + vecScript.string()                    + "\""
+                " --video \""                    + videoPath             + "\""
+                " --masks \""                    + masksPath.string()    + "\""
+                " --output \""                   + polyAllOut.string()   + "\""
                 " --method all"
-                " --hed-model \""    + hedModel.string()     + "\""
-                " --depth-model \""  + depthModel.string()   + "\""
-                " --device "         + kSam2Device;
+                " --edter-model \""              + edterModel.string()   + "\""
+                " --diffusion-edge-model \""     + diffEdgeModel.string()  + "\""
+                " --diffusion-edge-first-stage-model \"" + diffEdgeStage1.string() + "\""
+                " --diffusion-edge-config \""    + diffEdgeConfig.string() + "\""
+                " --device "                     + kSam2Device;
 
             // encode commands — one per method
-            static const std::vector<std::string> kAllMethods = {"canny","hed","depth","thin","depth_iso","flow","hatch","lum_iso"};
+            static const std::vector<std::string> kAllMethods = {"canny","hed","edter","diffusion_edge"};
             std::vector<std::string> encCmds;
             std::vector<fs::path>    animPaths;
             for (const auto& m : kAllMethods) {
@@ -965,7 +878,7 @@ int main()
                 PrintMenu(laser); continue;
             }
 
-            auto [masksPath, polyPath, animPath] = PipelinePaths(videoPath, "thin");
+            auto [masksPath, polyPath, animPath] = PipelinePaths(videoPath, "canny");
 
             fs::create_directories(masksPath.parent_path());
             fs::path segScript  = kProjectDir / "scripts" / "segment.py";
@@ -1021,7 +934,7 @@ int main()
                 std::cerr << "Usage: preview-masks <video>\n";
                 PrintMenu(laser); continue;
             }
-            auto [masksPath, polyPath, animPath] = PipelinePaths(videoPath, "thin");
+            auto [masksPath, polyPath, animPath] = PipelinePaths(videoPath, "canny");
             if (!fs::exists(masksPath)) {
                 std::cerr << "[preview] Masks not found: " << masksPath << "\n"
                              "  Run 'segment' first.\n";
@@ -1045,10 +958,10 @@ int main()
             ss >> videoPath >> method;
             videoPath = ResolveVideo(videoPath);
 
-            static const std::vector<std::string> kMethods = {"canny","hed","depth","thin","depth_iso","flow","hatch","lum_iso"};
+            static const std::vector<std::string> kMethods = {"canny","hed","edter","diffusion_edge"};
             if (videoPath.empty() || method.empty() ||
                 std::find(kMethods.begin(), kMethods.end(), method) == kMethods.end()) {
-                std::cerr << "Usage: vectorize <video> <canny|hed|depth|thin|depth_iso|flow|hatch|lum_iso>\n";
+                std::cerr << "Usage: vectorize <video> <canny|hed|edter|diffusion_edge>\n";
                 PrintMenu(laser); continue;
             }
 
@@ -1059,19 +972,23 @@ int main()
                 PrintMenu(laser); continue;
             }
             fs::create_directories(polyPath.parent_path());
-            fs::path vecScript  = kProjectDir / "scripts" / "vectorize.py";
-            fs::path hedModel   = kProjectDir / "models"  / "hed"   / "model.onnx";
-            fs::path depthModel = kProjectDir / "models"  / "depth" / "model.onnx";
+            fs::path vecScript      = kProjectDir / "scripts" / "vectorize.py";
+            fs::path edterModel     = kProjectDir / "models" / "edter"          / "EDTER-BSDS-VOC-StageI.pth";
+            fs::path diffEdgeModel  = kProjectDir / "models" / "diffusion_edge" / "bsds.pt";
+            fs::path diffEdgeStage1 = kProjectDir / "models" / "diffusion_edge" / "first_stage_total_320.pt";
+            fs::path diffEdgeCfg    = kProjectDir / "models" / "diffusion_edge" / "bsds_sample.yaml";
 
             std::string cmd =
-                kPython + " \"" + vecScript.string()    + "\""
-                " --video \""        + videoPath           + "\""
-                " --masks \""        + masksPath.string()  + "\""
-                " --output \""       + polyPath.string()   + "\""
-                " --method "         + method              +
-                " --hed-model \""    + hedModel.string()   + "\""
-                " --depth-model \""  + depthModel.string() + "\""
-                " --device "         + kSam2Device;
+                kPython + " \"" + vecScript.string()                    + "\""
+                " --video \""                    + videoPath             + "\""
+                " --masks \""                    + masksPath.string()    + "\""
+                " --output \""                   + polyPath.string()     + "\""
+                " --method "                     + method                +
+                " --edter-model \""              + edterModel.string()   + "\""
+                " --diffusion-edge-model \""     + diffEdgeModel.string()  + "\""
+                " --diffusion-edge-first-stage-model \"" + diffEdgeStage1.string() + "\""
+                " --diffusion-edge-config \""    + diffEdgeCfg.string()    + "\""
+                " --device "                     + kSam2Device;
 
             if (g_videoThread.joinable()) {
                 g_videoProcessing = false;
@@ -1081,7 +998,9 @@ int main()
             g_videoProcessing = true;
             g_videoThread = std::thread([cmd, polyPath]() mutable {
                 std::cout << "\n[vectorize] Running ...\n" << std::flush;
+
                 FILE* pipe = _popen(("\"" + cmd + " 2>&1\"").c_str(), "r");
+
                 if (pipe) {
                     char buf[512];
                     while (fgets(buf, sizeof(buf), pipe))
@@ -1135,10 +1054,10 @@ int main()
             ss >> videoPath >> method;
             videoPath = ResolveVideo(videoPath);
 
-            static const std::vector<std::string> kMethods = {"canny","hed","depth","thin","depth_iso","flow","hatch","lum_iso"};
+            static const std::vector<std::string> kMethods = {"canny","hed","edter","diffusion_edge"};
             if (videoPath.empty() || method.empty() ||
                 std::find(kMethods.begin(), kMethods.end(), method) == kMethods.end()) {
-                std::cerr << "Usage: encode <video> <canny|hed|depth|thin|depth_iso|flow|hatch|lum_iso>\n";
+                std::cerr << "Usage: encode <video> <canny|hed|edter|diffusion_edge>\n";
                 PrintMenu(laser); continue;
             }
 
@@ -1171,11 +1090,14 @@ int main()
                         std::cout << buf << std::flush;
                     _pclose(pipe);
                 }
-                auto anim = ILDAFile::Load(animPath.string());
+                // encode.py always writes baked files now
+                auto anim = ILDAFile::LoadFlat(animPath.string());
                 if (!anim.empty()) {
                     {
                         std::lock_guard<std::mutex> lock(g_animationMutex);
-                        g_videoAnimation = std::move(anim);
+                        g_videoAnimationPhysical = std::move(anim);
+                        g_videoAnimation.clear();
+                        g_videoBaked             = true;
                     }
                     g_nowPlaying      = animPath.filename().string();
                     g_videoReady      = true;
@@ -1218,6 +1140,42 @@ int main()
                              g_configDirty = true; }
             }
             PrintMenu(laser); continue;
+        }
+
+        if (line.rfind("scale ", 0) == 0) {
+            try {
+                float val = std::stof(line.substr(6));
+                if (val >= -1.0f && val <= 2.0f) {
+                    g_animationScale = val;
+                    std::cout << "Set animation scale to " << g_animationScale << "\n";
+                }
+                else {
+                    std::cout << "Scale must be between -1 and 2.\n";
+                }
+            }
+            catch (...) {
+                std::cout << "Usage: scale [number from -1 to 2]\n";
+            }
+            PrintMenu(laser);
+            continue;
+        }
+
+        if (line.rfind("brightness ", 0) == 0) {
+            try {
+                float val = std::stof(line.substr(6));
+                if (val >= 0.0f && val <= 1.0f) {
+                    g_animationBrightness = val;
+                    std::cout << "Set animation brightness to " << g_animationBrightness << "\n";
+                }
+                else {
+                    std::cout << "Scale must be between 0 and 1.\n";
+                }
+            }
+            catch (...) {
+                std::cout << "Usage: scale [number from 0 to 1]\n";
+            }
+            PrintMenu(laser);
+            continue;
         }
 
         std::cout << "Unknown command.\n";

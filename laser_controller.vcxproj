@@ -109,19 +109,23 @@
       <PreprocessorDefinitions>NOMINMAX;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>D:\Projects\C++\laser_controller\libs\onnxruntime\gpu\include;D:\Projects\C++\laser_controller\libs\portaudio\include;D:\Projects\C++\laser_controller\libs\helios;D:\Projects\C++\laser_controller\libs\opencv\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\video;D:\Projects\C++\laser_controller\libs\onnxruntime\gpu\include;D:\Projects\C++\laser_controller\libs\helios;D:\Projects\C++\laser_controller\libs\opencv\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>D:\Projects\C++\laser_controller\libs\helios\libusb_bin\Windows\x64\Debug\dll;D:\Projects\C++\laser_controller\libs\onnxruntime\gpu\lib;D:\Projects\C++\laser_controller\libs\portaudio\lib;D:\Projects\C++\laser_controller\libs\helios;D:\Projects\C++\laser_controller\libs\opencv\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>libusb-1.0.lib;portaudio_x64.lib;onnxruntime.lib;opencv_world4130d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>D:\Projects\C++\laser_controller\libs\helios\libusb_bin\Windows\x64\Debug\dll;D:\Projects\C++\laser_controller\libs\onnxruntime\gpu\lib;D:\Projects\C++\laser_controller\libs\helios;D:\Projects\C++\laser_controller\libs\opencv\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libusb-1.0.lib;onnxruntime.lib;opencv_world4130d.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /y /d "$(ProjectDir)libs\helios\libusb-1.0.dll" "$(OutDir)"
-xcopy /y /d "$(ProjectDir)libs\portaudio\bin\portaudio_x64.dll" "$(OutDir)"
+      <Command>xcopy /y /d "$(ProjectDir)libs\helios\libusb_bin\Windows\x64\Debug\dll\libusb-1.0.dll" "$(OutDir)"
 xcopy /y /d "$(ProjectDir)libs\onnxruntime\gpu\bin\*.dll" "$(OutDir)"
-xcopy /y /d "$(ProjectDir)libs\opencv\build\x64\vc16\bin\opencv_world4130d.dll" "$(OutDir)"</Command>
+xcopy /y /d "$(ProjectDir)libs\opencv\build\x64\vc16\bin\opencv_world4130d.dll" "$(OutDir)"
+xcopy /y /d "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin\cudart64_12.dll" "$(OutDir)"
+xcopy /y /d "C:\Program Files\NVIDIA\cudnn\v9.17\bin\12.9\cudnn64_9.dll" "$(OutDir)"
+xcopy /y /d "C:\Program Files\NVIDIA\cudnn\v9.17\bin\12.9\cudnn_ops64_9.dll" "$(OutDir)"
+xcopy /y /d "C:\Program Files\NVIDIA\cudnn\v9.17\bin\12.9\cudnn_cnn64_9.dll" "$(OutDir)"
+xcopy /y /d "C:\Program Files\NVIDIA\cudnn\v9.17\bin\12.9\cudnn_adv64_9.dll" "$(OutDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -133,61 +137,41 @@ xcopy /y /d "$(ProjectDir)libs\opencv\build\x64\vc16\bin\opencv_world4130d.dll" 
       <PreprocessorDefinitions>NOMINMAX;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>D:\Projects\C++\laser_controller\libs\onnxruntime\gpu\include;D:\Projects\C++\laser_controller\libs\portaudio\include;D:\Projects\C++\laser_controller\libs\helios;D:\Projects\C++\laser_controller\libs\opencv\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\video;D:\Projects\C++\laser_controller\libs\onnxruntime\gpu\include;D:\Projects\C++\laser_controller\libs\helios;D:\Projects\C++\laser_controller\libs\opencv\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>D:\Projects\C++\laser_controller\libs\helios\libusb_bin\Windows\x64\Release\dll;D:\Projects\C++\laser_controller\libs\onnxruntime\gpu\lib;D:\Projects\C++\laser_controller\libs\portaudio\lib;D:\Projects\C++\laser_controller\libs\helios;D:\Projects\C++\laser_controller\libs\opencv\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>libusb-1.0.lib;portaudio_x64.lib;onnxruntime.lib;opencv_world4130.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>D:\Projects\C++\laser_controller\libs\helios\libusb_bin\Windows\x64\Release\dll;D:\Projects\C++\laser_controller\libs\onnxruntime\gpu\lib;D:\Projects\C++\laser_controller\libs\helios;D:\Projects\C++\laser_controller\libs\opencv\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libusb-1.0.lib;onnxruntime.lib;opencv_world4130.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /y /d "$(ProjectDir)libs\helios\libusb-1.0.dll" "$(OutDir)"
-xcopy /y /d "$(ProjectDir)libs\portaudio\bin\portaudio_x64.dll" "$(OutDir)"
+      <Command>xcopy /y /d "$(ProjectDir)libs\helios\libusb_bin\Windows\x64\Release\dll\libusb-1.0.dll" "$(OutDir)"
 xcopy /y /d "$(ProjectDir)libs\onnxruntime\gpu\bin\*.dll" "$(OutDir)"
 xcopy /y /d "$(ProjectDir)libs\opencv\build\x64\vc16\bin\opencv_world4130.dll" "$(OutDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="AudioPipeline.cpp" />
-    <ClCompile Include="ILDAFile.cpp" />
-    <ClCompile Include="AudioAnalyzer.cpp" />
-    <ClCompile Include="CLAPInference.cpp" />
-    <ClCompile Include="HEDInference.cpp" />
-    <ClCompile Include="SAMInference.cpp" />
-    <ClCompile Include="HeliosOutput.cpp" />
-    <ClCompile Include="laser_controller.cpp" />
-    <ClCompile Include="MusicGeometryEngine.cpp" />
-    <ClCompile Include="BeatSyncEngine.cpp" />
-    <ClCompile Include="MusicPipeline.cpp" />
-    <ClCompile Include="PitchAnalyzer.cpp" />
+    <ClCompile Include="src\laser_controller.cpp" />
+    <ClCompile Include="src\core\HeliosOutput.cpp" />
+    <ClCompile Include="src\core\ILDAFile.cpp" />
     <ClCompile Include="libs\helios\HeliosDac.cpp" />
     <ClCompile Include="libs\helios\idn\idn.cpp" />
     <ClCompile Include="libs\helios\idn\idnServerList.cpp" />
     <ClCompile Include="libs\helios\idn\plt-windows.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="AudioPipeline.h" />
-    <ClInclude Include="ILDAFile.h" />
-    <ClInclude Include="AudioAnalyzer.h" />
-    <ClInclude Include="AudioFeatures.h" />
-    <ClInclude Include="CLAPInference.h" />
-    <ClInclude Include="HEDInference.h" />
-    <ClInclude Include="SAMInference.h" />
-    <ClInclude Include="HeliosOutput.h" />
-    <ClInclude Include="GeometryPoint3D.h" />
-    <ClInclude Include="GeometryShapes.h" />
-    <ClInclude Include="MusicGeometryEngine.h" />
-    <ClInclude Include="BeatSyncEngine.h" />
-    <ClInclude Include="MusicPipeline.h" />
-    <ClInclude Include="PitchAnalyzer.h" />
+    <ClInclude Include="src\core\HeliosOutput.h" />
+    <ClInclude Include="src\core\ILDAFile.h" />
     <ClInclude Include="libs\helios\HeliosDac.h" />
     <ClInclude Include="libs\helios\idn\idn-hello.h" />
     <ClInclude Include="libs\helios\idn\idn-stream.h" />
     <ClInclude Include="libs\helios\idn\idn.h" />
     <ClInclude Include="libs\helios\idn\idnServerList.h" />
     <ClInclude Include="libs\helios\libusb.h" />
-    <ClInclude Include="pocketfft.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include=".github\copilot-instructions.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

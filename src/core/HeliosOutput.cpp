@@ -87,13 +87,16 @@ void HeliosOutput::SendFrame(const std::vector<std::vector<LaserPoint>>& polylin
     // --- Budget distribution ---
     int totalBudget = config_.max_pps / config_.target_fps;
 
-    // Estimate transition overhead
+    // Estimate transition overhead — seed from actual tracked galvo position
+    // so budget allocation is accurate even when the galvo isn't at centre.
     int overhead = 0;
-    HeliosPoint center{};
-    center.x = 2048; center.y = 2048;
+    HeliosPoint trackedPos{};
+    trackedPos.x = (uint16_t)lastEndX_.load(std::memory_order_relaxed);
+    trackedPos.y = (uint16_t)lastEndY_.load(std::memory_order_relaxed);
+    trackedPos.r = trackedPos.g = trackedPos.b = trackedPos.i = 0;
     for (size_t i = 0; i < scaled.size(); ++i) {
         if (scaled[i].empty()) continue;
-        HeliosPoint from = (i == 0) ? center : scaled[i - 1].back();
+        HeliosPoint from = (i == 0) ? trackedPos : scaled[i - 1].back();
         overhead += EstimateTransitionCost(from, scaled[i].front());
     }
 
@@ -121,6 +124,23 @@ void HeliosOutput::SendFrame(const std::vector<std::vector<LaserPoint>>& polylin
     // Build and send
     auto frame = BuildFrame(scaled);
     if (frame.empty()) return;
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        while (frameQueue_.size() > 2)
+            frameQueue_.pop();
+        frameQueue_.push(std::move(frame));
+    }
+    queueCV_.notify_one();
+}
+
+void HeliosOutput::SendPhysical(const std::vector<HeliosPoint>& points)
+{
+    if (!connected_ || points.size() < 2) return;
+
+    // Already-baked: every point in here is a point the DAC will play.
+    // Just queue.  Phase correction happens in DacThreadFunc.
+    std::vector<HeliosPoint> frame = points;
 
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
@@ -259,39 +279,98 @@ void HeliosOutput::ReorderPath(std::vector<std::vector<HeliosPoint>>& polylines)
 {
     if (polylines.size() < 2) return;
 
-    std::vector<std::vector<HeliosPoint>> sorted;
-    sorted.reserve(polylines.size());
+    const size_t N = polylines.size();
+    const float  W = config_.reorder_angle_weight;  // ILDA units per (1 - cos θ)
 
-    std::vector<bool> visited(polylines.size(), false);
+    // ── Pre-compute exit directions for forward and reversed traversal ────────
+    // fwd_ex/ey: unit direction of the LAST step when traversed forward
+    // rev_ex/ey: unit direction of the LAST step when traversed reversed
+    //            = negated unit direction of the FIRST step traversed forward
+    struct ExitDir { float fwd_ex, fwd_ey, rev_ex, rev_ey; };
+    std::vector<ExitDir> exits(N);
 
-    // Start from center
-    HeliosPoint current{};
-    current.x = 2048;
-    current.y = 2048;
-
-    for (size_t n = 0; n < polylines.size(); ++n)
+    for (size_t i = 0; i < N; ++i)
     {
-        float bestDist = std::numeric_limits<float>::max();
-        int   bestIdx = -1;
+        const auto& p = polylines[i];
+        auto unit = [](float dx, float dy, float fb_ex, float fb_ey)
+            -> std::pair<float, float>
+        {
+            float len = std::sqrt(dx * dx + dy * dy);
+            return (len > 0.5f) ? std::make_pair(dx / len, dy / len)
+                                : std::make_pair(fb_ex,     fb_ey);
+        };
+
+        if (p.size() >= 2) {
+            // forward exit: last step direction
+            auto [fex, fey] = unit((float)(p.back().x    - p[p.size()-2].x),
+                                   (float)(p.back().y    - p[p.size()-2].y),  1.f, 0.f);
+            // reversed exit: opposite of the forward entry (first step direction reversed)
+            auto [rex, rey] = unit((float)(p.front().x   - p[1].x),
+                                   (float)(p.front().y   - p[1].y), -1.f, 0.f);
+            exits[i] = { fex, fey, rex, rey };
+        }
+        else {
+            exits[i] = { 1.f, 0.f, -1.f, 0.f };
+        }
+    }
+
+    // ── Nearest-neighbour TSP with angle penalty ──────────────────────────────
+    //
+    // cost(cur → seg_endpoint) = Euclidean distance
+    //                           + W · (1 − dot(cur_dir, travel_dir))
+    //
+    // The second term penalises blank jumps that require the galvo to reverse
+    // direction: going straight ahead costs 0 extra; a full reversal costs 2·W.
+    // W = 100 means a 180° reversal adds 200 ILDA-unit equivalent penalty,
+    // roughly the cost of a small additional travel segment.
+
+    std::vector<std::vector<HeliosPoint>> sorted;
+    sorted.reserve(N);
+    std::vector<bool> visited(N, false);
+
+    // Seed from actual tracked galvo position so reorder reflects real state
+    HeliosPoint cur{};
+    cur.x = (uint16_t)lastEndX_.load(std::memory_order_relaxed);
+    cur.y = (uint16_t)lastEndY_.load(std::memory_order_relaxed);
+    float cur_dx = 1.0f, cur_dy = 0.0f;  // unknown initial direction → no penalty on first pick
+
+    for (size_t n = 0; n < N; ++n)
+    {
+        float bestCost    = std::numeric_limits<float>::max();
+        int   bestIdx     = -1;
         bool  bestReversed = false;
 
-        for (size_t i = 0; i < polylines.size(); ++i)
+        for (size_t i = 0; i < N; ++i)
         {
             if (visited[i]) continue;
 
-            float dStart = Distance(current, polylines[i].front());
-            float dEnd = Distance(current, polylines[i].back());
+            // Helper: cost from cur to a candidate endpoint
+            auto segCost = [&](const HeliosPoint& endpoint,
+                               bool firstSeg) -> float
+            {
+                float dist  = Distance(cur, endpoint);
+                if (firstSeg || dist < 0.5f)
+                    return dist;   // no angle penalty on the very first pick
 
-            if (dStart < bestDist) {
-                bestDist = dStart;
-                bestIdx = (int)i;
-                bestReversed = false;
-            }
-            if (dEnd < bestDist) {
-                bestDist = dEnd;
-                bestIdx = (int)i;
-                bestReversed = true;
-            }
+                float tdx = (float)(endpoint.x - cur.x);
+                float tdy = (float)(endpoint.y - cur.y);
+                float tlen = std::sqrt(tdx * tdx + tdy * tdy);
+                if (tlen < 0.5f)
+                    return dist;
+
+                float ndx  = tdx / tlen;
+                float ndy  = tdy / tlen;
+                // (1 − cos θ) is 0 when cur_dir and travel_dir are aligned, 2 when opposed
+                float penalty = W * (1.0f - (cur_dx * ndx + cur_dy * ndy));
+                return dist + penalty;
+            };
+
+            bool  isFirst = (n == 0);
+            float costFwd = segCost(polylines[i].front(), isFirst);
+            float costRev = segCost(polylines[i].back(),  isFirst);
+
+            if (costFwd < bestCost) { bestCost = costFwd; bestIdx = (int)i; bestReversed = false; }
+            if (costRev < bestCost) { bestCost = costRev; bestIdx = (int)i; bestReversed = true;  }
         }
 
         if (bestIdx < 0) break;
@@ -299,8 +378,14 @@ void HeliosOutput::ReorderPath(std::vector<std::vector<HeliosPoint>>& polylines)
         visited[bestIdx] = true;
         if (bestReversed) {
             std::reverse(polylines[bestIdx].begin(), polylines[bestIdx].end());
+            cur_dx = exits[bestIdx].rev_ex;
+            cur_dy = exits[bestIdx].rev_ey;
         }
-        current = polylines[bestIdx].back();
+        else {
+            cur_dx = exits[bestIdx].fwd_ex;
+            cur_dy = exits[bestIdx].fwd_ey;
+        }
+        cur = polylines[bestIdx].back();
         sorted.push_back(std::move(polylines[bestIdx]));
     }
 
@@ -348,28 +433,44 @@ void HeliosOutput::InsertDwellAtPoint(
 
 int HeliosOutput::CalcCornerDwell(HeliosPoint a, HeliosPoint b, HeliosPoint c)
 {
-    float ax = (float)(b.x - a.x);
-    float ay = (float)(b.y - a.y);
-    float bx = (float)(c.x - b.x);
-    float by = (float)(c.y - b.y);
+    // Segment vectors A→B and B→C
+    float ax = (float)(b.x - a.x),  ay = (float)(b.y - a.y);
+    float bx = (float)(c.x - b.x),  by = (float)(c.y - b.y);
 
     float lenA = std::sqrt(ax * ax + ay * ay);
     float lenB = std::sqrt(bx * bx + by * by);
-
     if (lenA < 1.0f || lenB < 1.0f) return config_.min_vertex_hold;
 
-    float dot = (ax * bx + ay * by) / (lenA * lenB);
-    dot = std::clamp(dot, -1.0f, 1.0f);
-    float angleDeg = std::acos(dot) * 180.0f / 3.14159265f;
-
-    // below curve threshold — galvo handles it via momentum, no dwell needed
+    // ── Scale-independent angle check (curve_threshold acts as a smoothness gate)
+    float dot = std::clamp((ax * bx + ay * by) / (lenA * lenB), -1.0f, 1.0f);
+    float angleDeg = std::acos(dot) * (180.0f / 3.14159265f);
     if (angleDeg < config_.curve_threshold)
         return 0;
 
-    // above threshold — scale proportionally between min and max
-    float t = (angleDeg - config_.curve_threshold) /
-        (180.0f - config_.curve_threshold);
-    int   dwell = (int)(t * config_.max_vertex_hold);
+    // ── Menger curvature  κ = 2·|cross(AB,BC)| / (|AB|·|BC|·|AC|)
+    //
+    // Unlike the old angle-only formula, κ also accounts for segment length:
+    // the same turn angle on a SHORT segment yields higher κ (the galvo must
+    // change direction faster), so it correctly demands more dwell time.
+    //
+    // For equal-length segments of length L: κ = 2·sin(θ/2) / L
+    //   • straight line  (θ = 0°)  → κ = 0
+    //   • 90° corner     (θ = 90°) → κ = √2 / L  ≈ 1.414 / L
+    //   • hairpin        (θ = 180°)→ κ = 2 / L
+    float cross_z = ax * by - ay * bx;        // 2-D cross product (z-component)
+    float lenAC   = Distance(a, c);
+
+    float kappa;
+    if (lenAC > 0.5f) {
+        kappa = 2.0f * std::abs(cross_z) / (lenA * lenB * lenAC);
+    }
+    else {
+        // Degenerate hairpin: A and C nearly coincide → κ → 2 / max(segment)
+        kappa = 2.0f / std::max(lenA, lenB);
+    }
+
+    // Scale to a point count and clamp to configured range
+    int dwell = (int)(kappa * config_.kappa_scale);
     return std::clamp(dwell, config_.min_vertex_hold, config_.max_vertex_hold);
 }
 
@@ -466,6 +567,45 @@ std::vector<HeliosPoint> HeliosOutput::ResampleToCount(
 
 
 // -----------------------------------------------------------------------------
+// ApplyPhaseCorrection
+// -----------------------------------------------------------------------------
+
+void HeliosOutput::ApplyPhaseCorrection(std::vector<HeliosPoint>& frame)
+{
+    // The Y galvo servo typically has a slightly different phase response to X.
+    // This manifests as diagonal lines bowing: the Y position lags behind the
+    // commanded value relative to X by a fraction of a point interval.
+    //
+    // Correction: advance Y by xy_phase_shift samples using linear interpolation.
+    // Y_corrected[n] = lerp(Y_input[n + floor(shift)], Y_input[n + ceil(shift)], frac)
+    //
+    // A shift of 0.3 at 30 kpps corresponds to a 10 µs Y lag — typical for
+    // modest-bandwidth galvo drivers.  Tune by projecting a 45° diagonal and
+    // adjusting until the line appears straight at full scan speed.
+
+    const float shift = config_.xy_phase_shift;
+    if (shift <= 0.0f || frame.size() < 2)
+        return;
+
+    const size_t n   = frame.size();
+    const int    lo  = (int)shift;           // floor of shift
+    const float  frac = shift - (float)lo;   // fractional remainder
+
+    // Snapshot the original Y values before overwriting
+    std::vector<uint16_t> y0(n);
+    for (size_t i = 0; i < n; ++i)
+        y0[i] = frame[i].y;
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        // Source indices, clamped to frame boundary
+        size_t j = std::min(i + (size_t)lo,     n - 1);
+        size_t k = std::min(i + (size_t)lo + 1, n - 1);
+        frame[i].y = (uint16_t)((float)y0[j] + ((float)y0[k] - (float)y0[j]) * frac);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // DAC thread
 // -----------------------------------------------------------------------------
 
@@ -504,6 +644,11 @@ void HeliosOutput::DacThreadFunc()
         }
 
         if (currentFrame.empty()) continue;
+
+        // Apply Y-axis phase correction before the frame goes to hardware.
+        // This is the last processing step — done here so the correction is
+        // always applied regardless of which Send* path built the frame.
+        ApplyPhaseCorrection(currentFrame);
 
         // Record where the galvo will be after this frame completes so the
         // next BuildFrame call can start its travel from the right position.

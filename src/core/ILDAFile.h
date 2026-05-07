@@ -1,5 +1,6 @@
 #pragma once
 #include "HeliosOutput.h"
+#include "libs/helios/HeliosDac.h"
 #include <string>
 #include <vector>
 
@@ -35,8 +36,23 @@ public:
                      const std::vector<Frame>& animation,
                      const std::string& name = "laserctrl");
 
-    // Load animation from path. Returns empty vector on failure.
+    // Load animation from path as logical polylines (blank-flag separates
+    // polylines).  Used for the legacy un-baked .ild format and runtime
+    // SendFrame() pathway.  Returns empty vector on failure.
     static std::vector<Frame> Load(const std::string& path);
+
+    // Load animation as flat per-frame HeliosPoint sequences (12-bit ILDA
+    // coords + intensity), preserving every point including blanking.
+    // This is the path for "physically baked" .ild files produced by the
+    // post-Phase-1 encode.py — every point in the file is a point the DAC
+    // will play, so no further processing is needed at runtime.
+    static std::vector<std::vector<HeliosPoint>>
+        LoadFlat(const std::string& path);
+
+    // True if the file's first frame header has company="LZRBAKED",
+    // indicating encode.py has baked all blanking/dwells/travels into the
+    // file.  Use LoadFlat + HeliosOutput::SendPhysical for these.
+    static bool IsBaked(const std::string& path);
 
     // Print frame/point counts without fully loading.
     static void PrintInfo(const std::string& path);

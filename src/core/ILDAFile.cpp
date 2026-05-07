@@ -202,6 +202,99 @@ std::vector<Frame> ILDAFile::Load(const std::string& path)
 }
 
 // ---------------------------------------------------------------------------
+// IsBaked — check if the file is physically baked (company=="LZRBAKED").
+// ---------------------------------------------------------------------------
+
+bool ILDAFile::IsBaked(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    ILDAHeader hdr{};
+    if (!f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr))) return false;
+    if (std::memcmp(hdr.sig, "ILDA", 4) != 0) return false;
+    return std::memcmp(hdr.company, "LZRBAKED", 8) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// LoadFlat — read every point as-is into HeliosPoint format (12-bit ILDA).
+// Used for "physically baked" .ild files where the file IS the point sequence
+// the DAC will play, including all blanking, dwells, and eased travel.
+// ---------------------------------------------------------------------------
+
+std::vector<std::vector<HeliosPoint>>
+ILDAFile::LoadFlat(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "[ILDA] Cannot open: " << path << "\n";
+        return {};
+    }
+
+    std::vector<std::vector<HeliosPoint>> animation;
+
+    while (f) {
+        ILDAHeader hdr{};
+        if (!f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr))) break;
+
+        if (std::memcmp(hdr.sig, "ILDA", 4) != 0) {
+            std::cerr << "[ILDA] Bad signature at offset "
+                      << (static_cast<int>(f.tellg()) - sizeof(hdr)) << "\n";
+            break;
+        }
+
+        uint16_t numRecords = FromBE(hdr.numRecords);
+        if (numRecords == 0) break;     // EOF
+
+        if (hdr.format != 5) {
+            std::cerr << "[ILDA] LoadFlat only supports format 5; got "
+                      << (int)hdr.format << "\n";
+            break;
+        }
+
+        std::vector<HeliosPoint> frame;
+        frame.reserve(numRecords);
+
+        for (uint16_t pi = 0; pi < numRecords; ++pi) {
+            ILDAPoint5 pt{};
+            if (!f.read(reinterpret_cast<char*>(&pt), sizeof(pt))) {
+                std::cerr << "[ILDA] Unexpected EOF in frame.\n";
+                break;
+            }
+
+            int16_t  xs = static_cast<int16_t>(FromBE(static_cast<uint16_t>(pt.x)));
+            int16_t  ys = static_cast<int16_t>(FromBE(static_cast<uint16_t>(pt.y)));
+            bool     blank = (pt.status & 0x40) != 0;
+
+            // 16-bit signed [-32767..32767, centre 0] → 12-bit unsigned [0..4095, centre 2048]
+            int x12 = (int)std::lround(xs / 16.0f) + 2048;
+            int y12 = (int)std::lround(ys / 16.0f) + 2048;
+            x12 = std::clamp(x12, 0, 4095);
+            y12 = std::clamp(y12, 0, 4095);
+
+            HeliosPoint hp;
+            hp.x = static_cast<uint16_t>(x12);
+            hp.y = static_cast<uint16_t>(y12);
+            if (blank) {
+                hp.r = hp.g = hp.b = hp.i = 0;
+            } else {
+                hp.r = pt.r;
+                hp.g = pt.g;
+                hp.b = pt.b;
+                hp.i = std::max(pt.r, std::max(pt.g, pt.b));
+            }
+            frame.push_back(hp);
+        }
+
+        if (!frame.empty())
+            animation.push_back(std::move(frame));
+    }
+
+    std::cout << "[ILDA] LoadFlat: " << animation.size() << " frames, "
+              << path << "\n";
+    return animation;
+}
+
+// ---------------------------------------------------------------------------
 // PrintInfo
 // ---------------------------------------------------------------------------
 

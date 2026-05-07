@@ -84,3 +84,13 @@ desktop.ini
 __pycache__/
 venv/
 env/
+.venv/
+
+HELIOS_FIRMWARE/
+HELIOS_HARDWARE/
+
+.claude/
+
+resources/
+
+MUSIC_PIPELINE_INTEGRATON.txt

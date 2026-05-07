@@ -15,15 +15,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="laser_controller.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="CLAPInference.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="AudioPipeline.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="libs\helios\HeliosDac.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -36,20 +27,23 @@
     <ClCompile Include="libs\helios\idn\plt-windows.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="HeliosOutput.cpp">
+    <ClCompile Include="src\laser_controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\HeliosOutput.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\ILDAFile.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\video\DepthInference.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\video\HEDInference.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="CLAPInference.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="pocketfft.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="AudioPipeline.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="libs\helios\HeliosDac.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -68,8 +62,20 @@
     <ClInclude Include="libs\helios\idn\idn-stream.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="HeliosOutput.h">
+    <ClInclude Include="src\core\HeliosOutput.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\ILDAFile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\video\DepthInference.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\video\HEDInference.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include=".github\copilot-instructions.md" />
   </ItemGroup>
 </Project>
