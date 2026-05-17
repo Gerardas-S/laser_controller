@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Stage 3 — Temporal filter + Physical-Path Bake + ILDA encode
-============================================================
+Stage 3 — Temporal filter + Natural-cost ILDA bake
+==================================================
 
 Reads logical polylines (output of vectorize.py) and produces an ILDA file
-that contains the *exact* point sequence the laser will play.  All geometric
-optimisation that used to happen at runtime in HeliosOutput::BuildFrame is
-performed here:
+whose every point is a point the DAC will play.  Each frame is emitted at
+its NATURAL cost — only the points the geometry actually demands — so the
+DAC firmware can auto-loop simple frames at hundreds of Hz between
+RenderThread upload ticks.  No artificial frame-rate throttle, no
+budget-fill resampling, no preferred-tempo metadata.
+
+Pipeline:
 
     1.  Temporal persistence filter            (drop one-frame flickers)
-    2.  Angle-weighted nearest-neighbour TSP   (minimise inter-stroke travel)
-    3.  Brightness-uniform point allocation    (longer strokes get more pts)
-    4.  Quintic-eased blank travel between strokes
-    5.  Pre-on / post-on / blank dwells at stroke boundaries
-    6.  Menger-curvature corner dwells inside strokes
-
-The resulting .ild file is "physically faithful" — every point in the file is
-a point the DAC will play.  Other ILDA viewers will show what your laser will
-draw.  HeliosOutput becomes a thin wrapper around the Helios SDK.
+    2.  node_ids-based polyline chaining       (zero-blanking through junctions)
+    3.  Curvature-aware sample spacing         (v ≤ √(a_max/κ); straight = 2 pts)
+    4.  Angle-weighted nearest-neighbour TSP   (optional, minimise inter-stroke travel)
+    5.  Per-stroke quintic-eased blank travel
+    6.  Pre-on / post-on / blank dwells at stroke boundaries
+    7.  Menger-curvature corner dwells (with intensity compensation)
 
 Reads
 -----
@@ -49,22 +50,20 @@ def parse_args():
     p.add_argument('--polylines',  required=True, help='Input .json polylines')
     p.add_argument('--output',     required=True, help='Output .ild path')
 
+    # Outer SAM2 contour (stylistic — bright, point-expensive ring around the
+    # subject silhouette).  Drop it from the encoded animation when undesired.
+    p.add_argument('--exclude-outer',  action='store_true',
+                   help='Drop polylines tagged outer=True (the SAM2 silhouette).')
+
     # Temporal persistence
     p.add_argument('--persist-frames', type=int,   default=2)
     p.add_argument('--persist-dist',   type=int,   default=40)
 
-    # Frame budget — sized to maintain a target playback rate.  The lit-point
-    # budget is what's LEFT after per-polyline overhead (blanks + dwells +
-    # travel) is subtracted.  This matches the legacy HeliosOutput::SendFrame
-    # budgeting exactly, so output frame sizes — and therefore effective FPS —
-    # are preserved across the migration.
-    p.add_argument('--target-fps',  type=int, default=60,
-                   help='Target playback frame rate.  budget = max-pps / fps.')
-    p.add_argument('--max-pps',     type=int, default=30000,
-                   help='Hardware PPS ceiling — Helios DAC = 30000.')
-    p.add_argument('--min-lit-per-poly', type=int, default=2,
-                   help='Floor for lit-point count per polyline when budget is '
-                        'overhead-saturated.  Matches old polys*2 fallback.')
+    # Playback rate is decided at runtime by the C++ side (g_config.target_fps
+    # = host upload cadence; DAC always plays at max_pps).  The .ild file
+    # carries no tempo metadata, so there are no --target-fps / --max-pps
+    # arguments here — they would be vestigial since the encoder doesn't
+    # bake a per-frame point ceiling anymore.
 
     # Path reorder (angle-weighted TSP)
     p.add_argument('--reorder',         action='store_true',
@@ -73,10 +72,16 @@ def parse_args():
     p.add_argument('--reorder-angle-w', type=float, default=100.0,
                    help='Angle penalty weight (12-bit ILDA units per (1 - cos θ)).')
 
+    # node_ids-based zero-blanking chaining (consumes vectorize.py metadata)
+    p.add_argument('--no-chain-node-ids', action='store_true',
+                   help='Disable joining of polylines that share endpoint '
+                        'node_ids (debugging).  Default: chain them with no '
+                        'inter-polyline travel/blank/dwell.')
+
     # Per-stroke boundary dwells (count in points)
-    p.add_argument('--blank-points',    type=int, default=20)
-    p.add_argument('--pre-on-points',   type=int, default=8)
-    p.add_argument('--post-on-points',  type=int, default=8)
+    p.add_argument('--blank-points',    type=int, default=10)
+    p.add_argument('--pre-on-points',   type=int, default=5)
+    p.add_argument('--post-on-points',  type=int, default=5)
 
     # Eased blank travel
     p.add_argument('--move-speed',         type=float, default=100.0,
@@ -85,14 +90,33 @@ def parse_args():
     p.add_argument('--min-travel-points',  type=int,   default=8)
     p.add_argument('--max-travel-points',  type=int,   default=80)
 
-    # Corner dwell (Menger curvature)
-    p.add_argument('--min-vertex-hold',  type=int,   default=2)
-    p.add_argument('--max-vertex-hold',  type=int,   default=20)
+    # Corner dwell (Menger curvature).  Dwell points are emitted with
+    # intensity scaled by 1/D so the corner does not look brighter than the
+    # surrounding line — matches the advisor brightness-uniformity requirement.
+    p.add_argument('--min-vertex-hold',  type=int,   default=1)
+    p.add_argument('--max-vertex-hold',  type=int,   default=10)
     p.add_argument('--curve-threshold',  type=float, default=20.0,
                    help='Bend angle (degrees) below which no dwell is inserted.')
     p.add_argument('--kappa-scale',      type=float, default=500.0,
                    help='Dwell count = κ · kappa_scale, clamped to '
                         '[min_vertex_hold, max_vertex_hold].')
+
+    # Curvature-aware lit-point spacing.  Replaces the legacy density floor
+    # and arc-length-proportional budget allocator.  Each lit polyline keeps
+    # only the points its curvature demands: straight segments emit ~2
+    # endpoints, sharp curves pack samples densely so v ≤ sqrt(a_max / κ).
+    p.add_argument('--max-accel',    type=float, default=5000.0,
+                   help='Galvo acceleration ceiling in 12-bit-units per point². '
+                        'Caps spacing on sharp curves via Δs = sqrt(a_max / κ). '
+                        'Higher = looser corners, fewer points; lower = tighter, '
+                        'more points.')
+    p.add_argument('--min-spacing',  type=float, default=4.0,
+                   help='Floor on per-sample step in 12-bit units (~0.1%% of '
+                        'frame).  Prevents pathological over-sampling on noise.')
+    p.add_argument('--max-spacing',  type=float, default=100.0,
+                   help='Ceiling on per-sample step in 12-bit units.  Long '
+                        'straight edges still get a handful of samples for '
+                        'color interpolation.')
 
     return p.parse_args()
 
@@ -194,51 +218,86 @@ def _corner_dwell(a, b, c, kappa_scale, threshold_deg, min_hold, max_hold):
 
 
 # =============================================================================
-# Polyline resampling — arc-length proportional, gives uniform brightness
+# Curvature-aware lit-point spacing
 # =============================================================================
+#
+# Every input vertex from vectorize.py is preserved (V-W already simplified
+# the polyline; the encoder must not throw vertices away).  Between vertices
+# we INSERT extra samples only when local curvature demands them — straight
+# segments get zero inserts, sharp curves get tightly packed inserts so the
+# galvo can decelerate via v ≤ sqrt(max_accel / κ).
+#
+# Colors are linearly interpolated along arc length per segment.
+# `intensities` is read but ignored (same caveat as the previous resampler:
+# raw edge-map probabilities are too low to drive the laser; would need a
+# gamma/floor before re-enabling).
 
-def _resample_polyline(pts_xy, target_count, colors=None):
+def _curvature_resample(pts_xy, colors, max_accel, min_spacing, max_spacing):
     """
-    pts_xy   : list of (x12, y12) tuples
-    colors   : optional list of (r, g, b) per input point, will be interpolated
-    Returns  : list of (x12, y12, r, g, b) tuples with len = target_count
+    pts_xy      : list of (x12, y12) tuples
+    colors      : list of [r, g, b] in [0, 1], same length as pts_xy
+    max_accel   : galvo accel ceiling, 12-bit-units / point²
+    min_spacing : floor on inserted-sample spacing, 12-bit units
+    max_spacing : ceiling on inserted-sample spacing, 12-bit units
+
+    Returns     : list of (x12, y12, r, g, b) — input vertices preserved,
+                  plus curvature-driven inserts between them.
     """
     n = len(pts_xy)
-    if n < 2 or target_count < 2:
-        if colors is None:
-            return [(x, y, 1.0, 1.0, 1.0) for x, y in pts_xy]
-        return [(x, y, *c) for (x, y), c in zip(pts_xy, colors)]
+    if n < 2:
+        return [(x, y, c[0], c[1], c[2])
+                for (x, y), c in zip(pts_xy, colors)]
+    if n == 2:
+        # Single straight segment — emit as-is.
+        return [(pts_xy[0][0], pts_xy[0][1],
+                 colors[0][0], colors[0][1], colors[0][2]),
+                (pts_xy[1][0], pts_xy[1][1],
+                 colors[1][0], colors[1][1], colors[1][2])]
 
-    cum = [0.0] * n
-    for i in range(1, n):
-        cum[i] = cum[i - 1] + _dist(pts_xy[i - 1], pts_xy[i])
-    total = cum[-1]
-    if total < 0.001:
-        if colors is None:
-            return [(x, y, 1.0, 1.0, 1.0) for x, y in pts_xy[:target_count]]
-        return [(x, y, *c) for (x, y), c in
-                zip(pts_xy[:target_count], colors[:target_count])]
+    KAPPA_FLOOR = 1e-6   # avoid div-by-zero on collinear vertices
 
-    out      = []
-    interval = total / (target_count - 1)
-    seg      = 0
-    for i in range(target_count):
-        target_len = interval * i
-        while seg < n - 2 and cum[seg + 1] < target_len:
-            seg += 1
-        seg_len = cum[seg + 1] - cum[seg]
-        t = 0.0 if seg_len < 0.001 else (target_len - cum[seg]) / seg_len
-        t = max(0.0, min(1.0, t))
+    def _kappa_at(i):
+        """Per-vertex Menger κ; endpoints have no neighbour on one side."""
+        if i <= 0 or i >= n - 1:
+            return KAPPA_FLOOR
+        _, k = _menger_curvature(pts_xy[i - 1], pts_xy[i], pts_xy[i + 1])
+        return max(k, KAPPA_FLOOR)
 
-        x = pts_xy[seg][0] + (pts_xy[seg + 1][0] - pts_xy[seg][0]) * t
-        y = pts_xy[seg][1] + (pts_xy[seg + 1][1] - pts_xy[seg][1]) * t
-        if colors is None:
-            out.append((x, y, 1.0, 1.0, 1.0))
+    out = []
+    k_left = _kappa_at(0)  # κ at the segment's left endpoint, carried across iters
+
+    for i in range(n - 1):
+        ax, ay = pts_xy[i]
+        bx, by = pts_xy[i + 1]
+        ca = colors[i]
+        cb = colors[i + 1]
+
+        out.append((ax, ay, ca[0], ca[1], ca[2]))
+
+        seg_len = math.hypot(bx - ax, by - ay)
+        if seg_len >= min_spacing:
+            k_right = _kappa_at(i + 1)
+            # Spacing for this segment uses the worse of the two endpoint κs.
+            kappa = max(k_left, k_right)
+            ds    = max(min_spacing, min(max_spacing, math.sqrt(max_accel / kappa)))
+            n_ins = int(seg_len / ds) - 1   # endpoint is itself a sample
+            for j in range(1, n_ins + 1):
+                t  = j / (n_ins + 1)
+                x  = ax + (bx - ax) * t
+                y  = ay + (by - ay) * t
+                r  = ca[0] + (cb[0] - ca[0]) * t
+                g  = ca[1] + (cb[1] - ca[1]) * t
+                bc = ca[2] + (cb[2] - ca[2]) * t
+                out.append((x, y, r, g, bc))
+            k_left = k_right
         else:
-            r = colors[seg][0] + (colors[seg + 1][0] - colors[seg][0]) * t
-            g = colors[seg][1] + (colors[seg + 1][1] - colors[seg][1]) * t
-            b = colors[seg][2] + (colors[seg + 1][2] - colors[seg][2]) * t
-            out.append((x, y, r, g, b))
+            # Sub-min-spacing segment: don't insert anything, advance κ window.
+            k_left = _kappa_at(i + 1)
+
+    # Final vertex
+    last = pts_xy[-1]
+    cl   = colors[-1]
+    out.append((last[0], last[1], cl[0], cl[1], cl[2]))
     return out
 
 
@@ -327,40 +386,47 @@ def _reorder_polylines(polys12, start_pos, angle_weight):
 
 
 # =============================================================================
-# Physical frame builder — mirrors HeliosOutput::BuildFrame, in Python.
+# Natural-cost frame builder
 # =============================================================================
+#
+# Same per-polyline insertion structure as the old BuildFrame mirror, but:
+#   • Each "polyline" passed in here is a super-polyline produced by
+#     _chain_by_node_ids — internally already a continuous run of pixels
+#     (no inter-segment blanking).  Transitions are only inserted BETWEEN
+#     super-polylines.
+#   • Corner-dwell points are emitted with intensity = 1/D so a D-fold
+#     repeat at a vertex doesn't visually brighten the vertex.
 
-def _build_physical_frame(polys12, prev_end_pos, cfg):
+def _build_natural_frame(super_polys, prev_end_pos, cfg):
     """
-    polys12       : list of dicts {'pts': [(x12, y12, r, g, b), ...]}
-                    pts already include per-point color; pts already
-                    resampled to allocated length.
-    prev_end_pos  : (x12, y12) position the galvo will be at when this
-                    frame begins (last point of the previous frame).
-    cfg           : namespace with all the dwell/blank/travel params.
+    super_polys  : list of dicts {'pts': [(x12, y12, r, g, b), ...],
+                                   'closed': bool}
+                   from _chain_by_node_ids → _curvature_resample.
+    prev_end_pos : (x12, y12) galvo position at frame start.
+    cfg          : args namespace (blank/dwell/travel/corner params).
 
-    Returns       : (physical_points, end_pos)
-                    physical_points = list of (x12, y12, r, g, b, blank)
-                    end_pos = position after final lit point of the frame
+    Returns      : (physical_points, end_pos)
+                   physical_points = [(x12, y12, r, g, b, blank), ...]
+                   end_pos = position of final emitted point.
     """
     out = []
     cur = prev_end_pos
 
-    for poly in polys12:
+    for poly in super_polys:
         pts = poly['pts']
         if len(pts) < 2:
             continue
 
-        first = pts[0]                            # (x, y, r, g, b)
+        first = pts[0]
         last  = pts[-1]
         first_xy = (first[0], first[1])
         last_xy  = (last[0],  last[1])
 
         # 1. Eased blank travel from current galvo position to stroke start
         n_travel = _calc_travel_points(cur, first_xy,
-                                        cfg.move_speed,
-                                        cfg.min_travel_points,
-                                        cfg.max_travel_points)
+                                       cfg.move_speed,
+                                       cfg.min_travel_points,
+                                       cfg.max_travel_points)
         for i in range(n_travel):
             t = i / max(1, n_travel - 1)
             e = _quint_ease(t)
@@ -368,35 +434,45 @@ def _build_physical_frame(polys12, prev_end_pos, cfg):
             y = cur[1] + (first_xy[1] - cur[1]) * e
             out.append((x, y, 0.0, 0.0, 0.0, True))    # blank
 
-        # 2. Blank dwell at stroke start (galvo settles, laser still off)
+        # 2. Blank dwell at stroke start
         for _ in range(cfg.blank_points):
             out.append((first_xy[0], first_xy[1], 0.0, 0.0, 0.0, True))
 
-        # 3. Pre-on dwell — laser turns on, galvo already at position
+        # 3. Pre-on dwell
         for _ in range(cfg.pre_on_points):
-            out.append((first_xy[0], first_xy[1], first[2], first[3], first[4], False))
+            out.append((first_xy[0], first_xy[1],
+                        first[2], first[3], first[4], False))
 
-        # 4. Lit drawing with corner-dwell insertions
+        # 4. Lit drawing with corner-dwell insertions (intensity-compensated)
         for i in range(len(pts)):
             x, y, r, g, b = pts[i]
             out.append((x, y, r, g, b, False))
 
             if 0 < i < len(pts) - 1:
-                a = (pts[i - 1][0], pts[i - 1][1])
+                a  = (pts[i - 1][0], pts[i - 1][1])
                 bp = (pts[i][0],     pts[i][1])
-                c = (pts[i + 1][0], pts[i + 1][1])
+                c  = (pts[i + 1][0], pts[i + 1][1])
                 dwell = _corner_dwell(
                     a, bp, c,
                     cfg.kappa_scale, cfg.curve_threshold,
                     cfg.min_vertex_hold, cfg.max_vertex_hold)
-                for _ in range(dwell):
-                    out.append((x, y, r, g, b, False))
+                if dwell > 0:
+                    # Intensity compensation: the original vertex + dwell
+                    # repeats means (1 + dwell) hits at this position.  Scale
+                    # so total emitted energy ≈ a single point's energy.
+                    scale = 1.0 / (dwell + 1)
+                    # Retro-scale the just-emitted vertex too.
+                    px, py, pr, pg, pb, pbl = out[-1]
+                    out[-1] = (px, py, pr * scale, pg * scale, pb * scale, pbl)
+                    for _ in range(dwell):
+                        out.append((x, y, r * scale, g * scale, b * scale, False))
 
-        # 5. Post-on dwell at stroke end — laser stays on briefly
+        # 5. Post-on dwell
         for _ in range(cfg.post_on_points):
-            out.append((last_xy[0], last_xy[1], last[2], last[3], last[4], False))
+            out.append((last_xy[0], last_xy[1],
+                        last[2], last[3], last[4], False))
 
-        # 6. Blank dwell at end — laser off before next move
+        # 6. Blank dwell at end
         for _ in range(cfg.blank_points):
             out.append((last_xy[0], last_xy[1], 0.0, 0.0, 0.0, True))
 
@@ -406,99 +482,123 @@ def _build_physical_frame(polys12, prev_end_pos, cfg):
 
 
 # =============================================================================
-# Frame-budget allocator — matches HeliosOutput::SendFrame logic exactly.
+# Polyline chaining by shared node_ids
 # =============================================================================
 #
-# The frame budget is derived from PPS and FPS:  budget = max_pps / target_fps
+# vectorize.py / interior_skeleton_graph emits node_ids: (first_node, last_node)
+# on every interior polyline.  Two polylines whose endpoint node_ids match
+# end and start at the same sub-pixel position and can be drawn back-to-back
+# with ZERO blanking — no travel, no blank dwell, no pre/post-on.
 #
-# Per-polyline OVERHEAD is the cost of getting in and out of the stroke:
-#       eased blank travel + start blank dwell + pre-on + post-on + end blank dwell
-#
-# The lit budget is what's left:
-#       lit = max(budget - sum(overhead), polys × min_lit_per_poly)
-#
-# Lit points are then allocated proportionally to arc length so that all
-# strokes draw at uniform velocity (uniform brightness).
-#
-# The key behaviour preserved from the legacy runtime:  when overhead exceeds
-# budget (frames with many small polylines), lit collapses to the polys × 2
-# floor.  The total frame size is then dominated by overhead, FPS drops
-# gracefully, and the visual character — short flicks of light bridged by
-# many brief blank moves — is identical to the old runtime output.
+# We chain such polylines into "super-polylines" up front so the downstream
+# builder treats each super as one continuous stroke.
 
-def _estimate_overhead(prev_pos, first_xy, cfg):
-    """Per-polyline overhead estimate in points (matches BuildFrame exactly)."""
-    travel = _calc_travel_points(prev_pos, first_xy,
-                                 cfg.move_speed,
-                                 cfg.min_travel_points,
-                                 cfg.max_travel_points)
-    # BuildFrame inserts: travel + blank-start + pre-on + post-on + blank-end
-    return (travel
-            + cfg.blank_points       # start blank dwell
-            + cfg.pre_on_points
-            + cfg.post_on_points
-            + cfg.blank_points)      # end blank dwell
-
-
-def _allocate_and_resample(polys_norm, prev_end_pos, cfg, frame_budget):
+def _chain_by_node_ids(polys12):
     """
-    polys_norm    : input polylines in normalised [-1,1]
-    prev_end_pos  : (x12, y12) galvo position at frame start (for travel calc)
-    cfg           : args namespace
-    frame_budget  : total points for the whole frame (max_pps / target_fps)
-    Returns       : list of {'pts': [(x12, y12, r, g, b), ...], 'closed': bool}
-                    with arc-length-proportional lit-point counts.
+    polys12 : list of dicts {'pts': [(x12, y12, r, g, b), ...],
+                              'closed': bool,
+                              'node_ids': (a, b) or None}
+              (pts already curvature-resampled into the 5-tuple form).
+
+    Returns : list of dicts {'pts': [...],
+                              'closed': bool,
+                              'first_node_id': int or None,
+                              'last_node_id': int or None}
+              Each super-poly's pts are a single concatenated stroke.
     """
-    if not polys_norm:
+    n = len(polys12)
+    if n == 0:
         return []
 
-    # 12-bit ILDA conversion
-    xys = []
-    for p in polys_norm:
-        xy = [_norm_to_ilda12(pt[0], pt[1]) for pt in p['pts']]
-        xys.append(xy)
-    n = len(polys_norm)
-
-    # ── Estimate per-polyline overhead in playback order ──────────────────────
-    # The encoder's reorder pass (if enabled) already determined draw order.
-    # Travel cost depends on previous endpoint, so walk linearly through.
-    cur = prev_end_pos
-    overhead_total = 0
-    for xy in xys:
-        if not xy:
+    # Map node_id -> list of (poly_idx, 'a' or 'b') for polys that have one.
+    # Closed polylines and those without node_ids are excluded from chaining.
+    incidence = {}
+    chainable = [False] * n
+    for i, p in enumerate(polys12):
+        nid = p.get('node_ids')
+        if p.get('closed', False) or not nid:
             continue
-        overhead_total += _estimate_overhead(cur, xy[0], cfg)
-        cur = xy[-1]
+        a, b = nid
+        if a is None and b is None:
+            continue
+        chainable[i] = True
+        if a is not None:
+            incidence.setdefault(a, []).append((i, 'a'))
+        if b is not None:
+            incidence.setdefault(b, []).append((i, 'b'))
 
-    # ── Compute lit budget (matches OLD drawBudget) ───────────────────────────
-    lit_budget = max(frame_budget - overhead_total,
-                     n * cfg.min_lit_per_poly)
-
-    # ── Allocate proportionally to arc length ─────────────────────────────────
-    lengths = [_polyline_length(xy) for xy in xys]
-    total_len = sum(lengths)
-
+    visited = [False] * n
     out = []
-    if total_len < 0.001:
-        # Degenerate frame (zero-length polylines).  Distribute evenly.
-        per = max(cfg.min_lit_per_poly, lit_budget // max(1, n))
-        for i, xy in enumerate(xys):
-            res = _resample_polyline(xy, per) if len(xy) >= 2 else []
-            if res:
-                out.append({'pts': res,
-                            'closed': polys_norm[i].get('closed', False)})
-        return out
 
-    for i, (xy, length) in enumerate(zip(xys, lengths)):
-        if len(xy) < 2:
+    def _reversed_pts(pts):
+        return list(reversed(pts))
+
+    def _emit_pts(pts, oriented_forward):
+        return list(pts) if oriented_forward else _reversed_pts(pts)
+
+    def _grow(seed_idx):
+        # Initial orientation: forward
+        chain_pts = list(polys12[seed_idx]['pts'])
+        head_nid  = polys12[seed_idx]['node_ids'][0]
+        tail_nid  = polys12[seed_idx]['node_ids'][1]
+        visited[seed_idx] = True
+
+        # Extend at the tail.
+        while tail_nid is not None:
+            cands = [(j, end) for (j, end) in incidence.get(tail_nid, [])
+                     if not visited[j] and chainable[j]]
+            if len(cands) != 1:
+                break  # 0 = nowhere to go, >1 = ambiguous junction
+            j, end = cands[0]
+            jpts = polys12[j]['pts']
+            if end == 'a':
+                # jpts[0] meets tail_nid → append forward, skip duplicate seam
+                chain_pts.extend(jpts[1:])
+                tail_nid = polys12[j]['node_ids'][1]
+            else:
+                # jpts[-1] meets tail_nid → append reversed
+                chain_pts.extend(_reversed_pts(jpts)[1:])
+                tail_nid = polys12[j]['node_ids'][0]
+            visited[j] = True
+
+        # Extend at the head (build prefix in reverse).
+        prefix = []
+        while head_nid is not None:
+            cands = [(j, end) for (j, end) in incidence.get(head_nid, [])
+                     if not visited[j] and chainable[j]]
+            if len(cands) != 1:
+                break
+            j, end = cands[0]
+            jpts = polys12[j]['pts']
+            if end == 'b':
+                # jpts[-1] meets head_nid → prepend forward
+                prefix = list(jpts[:-1]) + prefix  # drop duplicate seam
+                head_nid = polys12[j]['node_ids'][0]
+            else:
+                # jpts[0] meets head_nid → prepend reversed
+                prefix = _reversed_pts(jpts)[:-1] + prefix
+                head_nid = polys12[j]['node_ids'][1]
+            visited[j] = True
+
+        return {'pts': prefix + chain_pts,
+                'closed': False,
+                'first_node_id': head_nid,
+                'last_node_id':  tail_nid}
+
+    for i in range(n):
+        if visited[i]:
             continue
-        share = int(lit_budget * (length / total_len))
-        share = max(cfg.min_lit_per_poly, share)
-        # No upsample cap — letting short polylines receive their length-
-        # proportional share is what makes uniform-brightness allocation work.
-        res = _resample_polyline(xy, share)
-        out.append({'pts': res,
-                    'closed': polys_norm[i].get('closed', False)})
+        if not chainable[i]:
+            # Closed polylines and node-less polylines pass through verbatim.
+            p = polys12[i]
+            out.append({'pts': list(p['pts']),
+                        'closed': p.get('closed', False),
+                        'first_node_id': None,
+                        'last_node_id':  None})
+            visited[i] = True
+        else:
+            out.append(_grow(i))
+
     return out
 
 
@@ -559,6 +659,17 @@ def temporal_persistence_filter(frames, frame_w, frame_h,
 # laser state, not a polyline separator.
 
 def _ilda_header(frame_idx, total_frames, num_points):
+    # ILDA Format 5 header (32 bytes, all multi-byte fields big-endian):
+    #   0– 3  magic "ILDA"
+    #   4– 6  reserved \x00\x00\x00
+    #      7  format code (5 = 2-D true-colour)
+    #   8–15  frame name  (8 ASCII bytes, space-padded)
+    #  16–23  company name (8 ASCII bytes)
+    #  24–25  number of records in this frame
+    #  26–27  frame number (0-based)
+    #  28–29  total frames
+    #     30  projector number
+    #     31  reserved
     # Company field == b'LZRBAKED' marks files as "physically baked" — every
     # point is already a DAC point.  Loaders detect this and skip BuildFrame.
     hdr  = b'ILDA'
@@ -632,57 +743,64 @@ def main():
     print(f'[encode] {len(frames)} input frames  method={method}  '
           f'({frame_w}×{frame_h})', flush=True)
 
+    # ── Optional: drop SAM2 outer-silhouette polylines ────────────────────────
+    if args.exclude_outer:
+        before = sum(len(fp) for fp in frames)
+        frames = [[p for p in fp if not p.get('outer', False)] for fp in frames]
+        after  = sum(len(fp) for fp in frames)
+        print(f'[encode] --exclude-outer: dropped {before - after} polylines '
+              f'({before} → {after})', flush=True)
+
     # ── 1. Temporal persistence filter ────────────────────────────────────────
     filtered = temporal_persistence_filter(
         frames, frame_w, frame_h,
         args.persist_frames, args.persist_dist)
 
     # ── 2. Per-frame baking pipeline ──────────────────────────────────────────
+    # Each source animation frame is encoded at its NATURAL point count.
+    # The C++ runtime plays every frame at max_pps and the DAC firmware
+    # auto-loops the buffered frame between RenderThread uploads, so simple
+    # frames refresh at hundreds of Hz without any in-file looping.
+    #
     # The animation loops, so frame 0's entry travel comes from the LAST
-    # frame's exit position.  For stationary patterns this is a no-op (frame's
-    # last lit point is also its first if it's closed).  For animations it
-    # eliminates the loop discontinuity after the first iteration.
+    # frame's exit position.
 
-    centre        = (2048.0, 2048.0)
-    frame_budget  = max(64, args.max_pps // max(1, args.target_fps))
+    centre = (2048.0, 2048.0)
 
-    print(f'[encode] Frame budget: {frame_budget} pts '
-          f'({args.max_pps} PPS / {args.target_fps} FPS)', flush=True)
+    def _prepare_supers(frame_polys, prev_end):
+        # 12-bit conversion + curvature-aware resample + node_ids chaining.
+        if not frame_polys:
+            return []
+        polys12 = []
+        for p in frame_polys:
+            xy = [_norm_to_ilda12(pt[0], pt[1]) for pt in p['pts']]
+            cs = p.get('colors', [[1.0, 1.0, 1.0]] * len(p['pts']))
+            pts_rs = _curvature_resample(xy, cs,
+                                          args.max_accel,
+                                          args.min_spacing,
+                                          args.max_spacing)
+            polys12.append({
+                'pts':      pts_rs,
+                'closed':   p.get('closed', False),
+                'node_ids': p.get('node_ids') if not args.no_chain_node_ids else None,
+            })
+        supers = _chain_by_node_ids(polys12)
+        if args.reorder:
+            supers = _reorder_polylines(supers, prev_end, args.reorder_angle_w)
+        return supers
 
-    # First pass: walk frames in order to determine each frame's exit
-    # position (needed so the next frame's entry-travel is correct).  We use
-    # placeholder end positions on this pass — they get refined on the second
-    # pass.  For frame 0, treat the animation as a loop and use the LAST
-    # frame's exit.
-    end_positions = []
-    cur = centre
+    # Single forward pass.  Frame 0's entry travel is baked from centre
+    # (one ~16-pt blank travel on the loop-wrap — invisible).  Every later
+    # frame's entry travel is baked from the prior frame's actual exit, so
+    # steady-state playback is exact.
+    physical_frames = []
+    prev_end = centre
     for frame_polys in filtered:
         if not frame_polys:
-            end_positions.append(cur); continue
-        allocated = _allocate_and_resample(frame_polys, cur, args, frame_budget)
-        if args.reorder:
-            allocated = _reorder_polylines(allocated, cur, args.reorder_angle_w)
-        if allocated and allocated[-1]['pts']:
-            last = allocated[-1]['pts'][-1]
-            cur = (last[0], last[1])
-        end_positions.append(cur)
-
-    # Second pass: actually build, using previous-frame exit as entry-travel
-    # source.  For frame 0, use the LAST frame's exit (looping behaviour).
-    physical_frames = []
-    n_frames = len(filtered)
-    for fi, frame_polys in enumerate(filtered):
-        if not frame_polys:
-            physical_frames.append([]); continue
-
-        prev_end = end_positions[(fi - 1) % n_frames] if n_frames > 0 else centre
-
-        allocated = _allocate_and_resample(frame_polys, prev_end,
-                                            args, frame_budget)
-        if args.reorder:
-            allocated = _reorder_polylines(allocated, prev_end, args.reorder_angle_w)
-
-        physical, _ = _build_physical_frame(allocated, prev_end, args)
+            physical_frames.append([])
+            continue
+        supers = _prepare_supers(frame_polys, prev_end)
+        physical, prev_end = _build_natural_frame(supers, prev_end, args)
         physical_frames.append(physical)
 
     # ── 3. Write ILDA ─────────────────────────────────────────────────────────

@@ -84,44 +84,11 @@ void HeliosOutput::SendFrame(const std::vector<std::vector<LaserPoint>>& polylin
     if (config_.enable_reorder)
         ReorderPath(scaled);
 
-    // --- Budget distribution ---
-    int totalBudget = config_.max_pps / config_.target_fps;
-
-    // Estimate transition overhead — seed from actual tracked galvo position
-    // so budget allocation is accurate even when the galvo isn't at centre.
-    int overhead = 0;
-    HeliosPoint trackedPos{};
-    trackedPos.x = (uint16_t)lastEndX_.load(std::memory_order_relaxed);
-    trackedPos.y = (uint16_t)lastEndY_.load(std::memory_order_relaxed);
-    trackedPos.r = trackedPos.g = trackedPos.b = trackedPos.i = 0;
-    for (size_t i = 0; i < scaled.size(); ++i) {
-        if (scaled[i].empty()) continue;
-        HeliosPoint from = (i == 0) ? trackedPos : scaled[i - 1].back();
-        overhead += EstimateTransitionCost(from, scaled[i].front());
-    }
-
-    int drawBudget = std::max(totalBudget - overhead,
-        (int)scaled.size() * 2);
-
-    // Compute lengths
-    std::vector<float> lengths(scaled.size());
-    float totalLength = 0.0f;
-    for (size_t i = 0; i < scaled.size(); ++i) {
-        lengths[i] = PolylineLength(scaled[i]);
-        totalLength += lengths[i];
-    }
-
-    // Resample each polyline to its budget share
-    for (size_t i = 0; i < scaled.size(); ++i) {
-        if (scaled[i].size() < 2) continue;
-        int allocated = (totalLength > 0.0f)
-            ? (int)(drawBudget * (lengths[i] / totalLength))
-            : (drawBudget / (int)scaled.size());
-        allocated = std::max(allocated, 2);
-        scaled[i] = ResampleToCount(scaled[i], allocated);
-    }
-
-    // Build and send
+    // No budget inflation.  The DAC plays whatever we queue at max PPS
+    // (see CalculatePPS) and the firmware auto-loops the buffered frame
+    // between RenderThread uploads.  A 300-point circle plays at ~100 Hz
+    // physically; a 50-point square at ~600 Hz.  Callers control point
+    // density by generating more or fewer points in the source polyline.
     auto frame = BuildFrame(scaled);
     if (frame.empty()) return;
 
@@ -201,6 +168,31 @@ std::vector<HeliosPoint> HeliosOutput::BuildFrame(
     currentPos.y = (uint16_t)lastEndY_.load(std::memory_order_relaxed);
     currentPos.r = currentPos.g = currentPos.b = currentPos.i = 0;
 
+    // ── Closed-loop short-circuit ────────────────────────────────────────────
+    // If the entire frame is a SINGLE polyline whose first ≈ last (a closed
+    // path: circle, square, looping wireframe, …), the firmware-loop seam
+    // between iterations is geometrically continuous and needs none of the
+    // per-polyline enter/exit envelope.  Emit only the lit points plus
+    // curvature-driven corner dwells.  At max PPS this gives a 100-point
+    // circle a 300 Hz physical refresh with uniform brightness — no fixed
+    // dot at the start vertex.  The very first iteration may draw a brief
+    // streak from the previous frame's exit to the loop start (laser stays
+    // on); accepted as a one-time scene-switch cost.
+    constexpr float SEAM_TOL = 50.0f;   // ~1 % of frame width in 12-bit units
+    if (polylines.size() == 1 && polylines[0].size() >= 3) {
+        const auto& p = polylines[0];
+        if (Distance(p.front(), p.back()) < SEAM_TOL) {
+            for (size_t i = 0; i < p.size(); ++i) {
+                frame.push_back(p[i]);
+                if (i > 0 && i < p.size() - 1) {
+                    int d = CalcCornerDwell(p[i - 1], p[i], p[i + 1]);
+                    if (d > 0) InsertDwellAtPoint(frame, p[i], d);
+                }
+            }
+            return frame;
+        }
+    }
+
     for (size_t pi = 0; pi < polylines.size(); ++pi)
     {
         const auto& poly = polylines[pi];
@@ -219,10 +211,7 @@ std::vector<HeliosPoint> HeliosOutput::BuildFrame(
         // 3. Pre-on dwell — laser turns on, galvo already at position
         InsertDwellAtPoint(frame, polyStart, config_.pre_on_points);
 
-        // After ScaleToILDA, before sending to DAC thread:
-        // 1. Fill gaps in each polyline
-        // 2. Insert corner dwell proportionally
-
+        // 4. Lit drawing with corner-dwell insertions
         for (size_t i = 0; i < poly.size(); ++i)
         {
             frame.push_back(poly[i]);
@@ -499,73 +488,6 @@ int HeliosOutput::CalcTravelPoints(HeliosPoint from, HeliosPoint to)
     return std::clamp(pts, config_.min_travel_points, config_.max_travel_points);
 }
 
-int HeliosOutput::CalculatePPS(int numPoints)
-{
-    int pps = numPoints * config_.target_fps;
-    return std::clamp(pps, config_.min_pps, config_.max_pps);
-}
-
-float HeliosOutput::PolylineLength(const std::vector<HeliosPoint>& poly)
-{
-    float len = 0.0f;
-    for (size_t i = 1; i < poly.size(); ++i)
-        len += Distance(poly[i - 1], poly[i]);
-    return len;
-}
-
-int HeliosOutput::EstimateTransitionCost(HeliosPoint from, HeliosPoint to)
-{
-    return config_.blank_points
-        + config_.pre_on_points
-        + config_.post_on_points
-        + CalcTravelPoints(from, to);
-}
-
-std::vector<HeliosPoint> HeliosOutput::ResampleToCount(
-    const std::vector<HeliosPoint>& poly, int targetCount)
-{
-    if (poly.size() < 2 || targetCount < 2) return poly;
-
-    // cumulative arc lengths
-    std::vector<float> cumLen(poly.size(), 0.0f);
-    for (size_t i = 1; i < poly.size(); ++i)
-        cumLen[i] = cumLen[i - 1] + Distance(poly[i - 1], poly[i]);
-
-    float totalLength = cumLen.back();
-    if (totalLength < 0.001f) return poly;
-
-    std::vector<HeliosPoint> out;
-    out.reserve(targetCount);
-
-    float  interval = totalLength / (targetCount - 1);
-    size_t seg = 0;
-
-    for (int i = 0; i < targetCount; ++i)
-    {
-        float targetLen = interval * i;
-
-        while (seg < poly.size() - 2 && cumLen[seg + 1] < targetLen)
-            ++seg;
-
-        float segLen = cumLen[seg + 1] - cumLen[seg];
-        float t = (segLen < 0.001f) ? 0.0f :
-            (targetLen - cumLen[seg]) / segLen;
-        t = std::clamp(t, 0.0f, 1.0f);
-
-        HeliosPoint p;
-        p.x = (uint16_t)(poly[seg].x + (poly[seg + 1].x - poly[seg].x) * t);
-        p.y = (uint16_t)(poly[seg].y + (poly[seg + 1].y - poly[seg].y) * t);
-        p.r = (uint8_t)(poly[seg].r + (poly[seg + 1].r - poly[seg].r) * t);
-        p.g = (uint8_t)(poly[seg].g + (poly[seg + 1].g - poly[seg].g) * t);
-        p.b = (uint8_t)(poly[seg].b + (poly[seg + 1].b - poly[seg].b) * t);
-        p.i = (uint8_t)std::max(p.r, std::max(p.g, p.b));
-        out.push_back(p);
-    }
-
-    return out;
-}
-
-
 // -----------------------------------------------------------------------------
 // ApplyPhaseCorrection
 // -----------------------------------------------------------------------------
@@ -655,8 +577,10 @@ void HeliosOutput::DacThreadFunc()
         lastEndX_.store((int)currentFrame.back().x, std::memory_order_relaxed);
         lastEndY_.store((int)currentFrame.back().y, std::memory_order_relaxed);
 
-        int pps = CalculatePPS((int)currentFrame.size());
-        helios_.WriteFrame(0, pps, HELIOS_FLAGS_SINGLE_MODE,
+        // The DAC always plays at max_pps; firmware auto-loops the buffered
+        // frame between RenderThread uploads, so small frames refresh at
+        // hundreds of Hz physically.  target_fps governs upload cadence only.
+        helios_.WriteFrame(0, config_.max_pps, HELIOS_FLAGS_SINGLE_MODE,
                            currentFrame.data(), (uint32_t)currentFrame.size());
     }
 }

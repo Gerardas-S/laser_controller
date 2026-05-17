@@ -123,11 +123,6 @@ private:
     float Distance(HeliosPoint a, HeliosPoint b);
     float QuintEaseInOut(float t);
     int   CalcTravelPoints(HeliosPoint from, HeliosPoint to);
-    int   CalculatePPS(int numPoints);
-    std::vector<HeliosPoint> ResampleToCount(const std::vector<HeliosPoint>& poly,
-        int targetCount);
-    float PolylineLength(const std::vector<HeliosPoint>& poly);
-    int   EstimateTransitionCost(HeliosPoint from, HeliosPoint to);
     int   CalcCornerDwell(HeliosPoint a, HeliosPoint b, HeliosPoint c);
     void  ApplyPhaseCorrection(std::vector<HeliosPoint>& frame);
 

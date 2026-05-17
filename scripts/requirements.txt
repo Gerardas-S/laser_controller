@@ -11,3 +11,4 @@ fvcore
 ema-pytorch
 omegaconf>=2.3.0
 scipy
+opencv-contrib-python>=4.5.0

@@ -140,8 +140,20 @@ static std::pair<float,float> Centroid(const std::vector<LaserPoint>& poly)
 
 Frame Scene_AlignmentCircle()
 {
-    const int   N      = 300;
-    const float R      = 0.5f;
+    // N=100 places the firmware-loop refresh at ~300 Hz on a 30 kPPS DAC
+    // (well above flicker fusion) with sub-pixel chord error against the
+    // true circle.  Pushing N higher only slows refresh; pushing N below
+    // ~80 reveals polygonal chord error.
+    //
+    // We emit EXACTLY N points (not N+1).  The firmware-loop transition
+    // from pt[N-1] to pt[0] is a chord of length R·2·sin(π/N) — identical
+    // to every other chord — drawn with the laser already on.  A duplicate
+    // closing point would double-illuminate pt[0] every loop and re-create
+    // the bright-dot artifact this scene exists to avoid.  BuildFrame's
+    // closed-polyline short-circuit (SEAM_TOL check) treats this as a
+    // looping path because Distance(pt[0], pt[N-1]) < SEAM_TOL.
+    const int   N      = 100;
+    const float R      = 0.35f;
     const float TWO_PI = 2.0f * 3.14159265f;
 
     std::vector<LaserPoint> pts;
@@ -184,245 +196,33 @@ std::atomic<bool> g_configDirty{ false };
 HeliosConfig g_config;
 std::mutex   g_configMutex;
 
-// Logical polyline animation buffer — kept for runtime-generated content
-// (alignment circle).  Played via HeliosOutput::SendFrame which synthesises
-// blanking/dwells live.  In-process direct-inference paths were removed;
-// the SAM2 pipeline (segment → vectorize → encode) is the sole
-// source of video-derived ILDA files.
-std::vector<Frame>  g_videoAnimation;
-
-// Physically-baked animation from encode.py — every point in the buffer is a
-// point the DAC will play, in 12-bit ILDA coords.  Played via SendPhysical.
-std::vector<std::vector<HeliosPoint>> g_videoAnimationPhysical;
+// Loaded ILDA animation — one HeliosPoint sequence per frame, in spec point
+// order.  All loaded .ild files land here; runtime sends them straight
+// through SendPhysical.  Per the ILDA spec a file IS the point sequence the
+// DAC plays, so there is no "logical polyline" intermediate form — the
+// runtime never re-bakes a loaded file through BuildFrame.
+std::vector<std::vector<HeliosPoint>> g_videoAnimation;
 
 std::mutex          g_animationMutex;
 std::atomic<bool>   g_videoProcessing{ false };
 std::atomic<bool>   g_videoReady{ false };
-std::atomic<bool>   g_videoBaked{ false };   // which buffer is active
 std::string         g_nowPlaying = "alignment circle";
 float               g_animationScale = 1.0f;
 float               g_animationBrightness = 1.0f;
+// Playback speed multiplier — scales the software frame-advance rate.
+//   1.0 = normal (advance rate = target_fps)
+//   0.5 = half speed (frames held twice as long)
+//   2.0 = double speed (frames advanced twice as fast)
+// Multiplicative with target_fps:  effective animation FPS = target_fps × speed.
+// Does NOT affect DAC point rate — only how often animFrame increments.
+// The DAC always plays at max_pps; the firmware auto-loops the buffered
+// frame between RenderThread upload ticks.
+float               g_animationSpeed = 1.0f;
 
 std::thread g_videoThread;
 
-enum class VideoMode { SAM2, SAM2_CANNY, SAM2_HED, SAM2_SEG, SAM2_ALL };
-VideoMode g_videoMode = VideoMode::SAM2;
-
-// -----------------------------------------------------------------------------
-// Video thread
-// -----------------------------------------------------------------------------
-
-void VideoThread(std::string videoPath, VideoMode mode)
-{
-    g_videoReady      = false;
-    g_videoProcessing = true;
-
-    fs::create_directories(kResourcesDir);
-
-    // -------------------------------------------------------------------------
-    // SAM2 variants — three-stage pipeline
-    //
-    //  Stage 1  segment.py   : video  → masks.npz          (cached per video+model)
-    //  Stage 2  vectorize.py : masks  → polylines.json      (per method)
-    //  Stage 3  encode.py    : polys  → animation.ild       (temporal filter + ILDA)
-    //
-    //  Output directories:
-    //    resources/masks/       {stem}_sam2-{model}.npz
-    //    resources/polylines/   {stem}_sam2-{model}_{method}.json
-    //    resources/animations/  {stem}_sam2-{model}_{method}.ild
-    // -------------------------------------------------------------------------
-    {
-        // --- Path setup ---
-        const std::string kModel    = "tiny";   // SAM2 model size (change here to upgrade)
-        const std::string kDevice   = "cuda";
-
-        std::string videoStem = fs::path(videoPath).stem().string();
-        std::string maskTag   = videoStem + "_sam2-" + kModel;
-
-        fs::path masksDir     = kResourcesDir / "masks";
-        fs::path polylinesDir = kResourcesDir / "polylines";
-        fs::path animsDir     = kResourcesDir / "animations";
-
-        fs::create_directories(masksDir);
-        fs::create_directories(polylinesDir);
-        fs::create_directories(animsDir);
-
-        fs::path segScript = kProjectDir / "scripts" / "segment.py";
-        fs::path vecScript = kProjectDir / "scripts" / "vectorize.py";
-        fs::path encScript = kProjectDir / "scripts" / "encode.py";
-        fs::path ckptDir   = kProjectDir / "models"  / "sam2";
-        fs::path masksPath  = masksDir / (maskTag + ".npz");
-
-        // Map VideoMode → interior method name used in filenames and --method arg
-        auto ModeMethod = [&]() -> std::string {
-            switch (mode) {
-                case VideoMode::SAM2_CANNY: return "canny";
-                case VideoMode::SAM2_HED:   return "hed";
-                case VideoMode::SAM2_SEG:   return "seg";
-                default:                    return "all";   // SAM2, SAM2_ALL
-            }
-        };
-        const std::string method = ModeMethod();
-
-        // --- Generic script runner: launches subprocess, streams stdout, returns success ---
-        auto RunScript = [&](const std::string& label, const std::string& cmd) -> bool
-        {
-                std::cout << '\n' << label << '\n' << std::flush;
-
-                // Torch native libs shipped inside the venv (ensure this path exists)
-                std::string torchLib = (kProjectDir / ".venv" / "Lib" / "site-packages" / "torch" / "lib").generic_string();
-
-                // Save current PATH and set a new PATH with torchLib prefixed
-                char* oldPathC = nullptr;
-                size_t oldPathLen = 0;
-                _dupenv_s(&oldPathC, &oldPathLen, "PATH");
-                std::string oldPath = oldPathC ? oldPathC : "";
-                free(oldPathC);
-                std::string newPath = torchLib + ";" + oldPath;
-                SetEnvironmentVariableA("PATH", newPath.c_str());
-
-                // Run the command via shell and stream output
-                // Keep the same quoting behavior you used before for cmd
-                std::string wrapped = "\"" + cmd + " 2>&1\"";
-                FILE* pipe = _popen(wrapped.c_str(), "r");
-                if (!pipe) {
-                    std::cerr << label << " Failed to launch subprocess\n";
-                    // restore PATH before returning
-                    SetEnvironmentVariableA("PATH", oldPath.c_str());
-                    return false;
-                }
-
-                char buf[512];
-                while (fgets(buf, sizeof(buf), pipe))
-                    std::cout << buf << std::flush;
-
-                int ret = _pclose(pipe);
-
-                // Restore original PATH
-                SetEnvironmentVariableA("PATH", oldPath.c_str());
-
-                if (ret != 0) {
-                    std::cerr << label << " Script exited with code " << ret << '\n';
-                }
-                return ret == 0;
-        };
-
-
-        // ── Stage 1: Segment ─────────────────────────────────────────────────
-        // Skip if masks file already exists (cache).
-        if (!fs::exists(masksPath)) {
-            std::string cmd =
-                kPython + " \"" + segScript.string()  + "\""
-                " --video \""          + videoPath           + "\""
-                " --output \""         + masksPath.string()  + "\""
-                " --model "            + kModel              +
-                " --checkpoint-dir \"" + ckptDir.string()    + "\""
-                " --device "           + kDevice;
-            if (!RunScript("[segment]", cmd)) {
-                g_videoProcessing = false; return;
-            }
-        } else {
-            std::cout << "[segment] Using cached masks: "
-                      << masksPath.filename() << '\n' << std::flush;
-        }
-
-        if (!g_videoProcessing) return;
-
-        // ── Stage 2: Vectorize ────────────────────────────────────────────────
-        // For 'all' mode, vectorize.py writes one JSON per method;
-        // the output arg is the base path and suffixes are inserted by the script.
-        fs::path vecBasePath = polylinesDir / (maskTag + (method == "all" ? ".json"
-                                                        : "_" + method + ".json"));
-        {
-            std::string cmd =
-                kPython + " \"" + vecScript.string()    + "\""
-                " --video \""        + videoPath             + "\""
-                " --masks \""        + masksPath.string()    + "\""
-                " --output \""       + vecBasePath.string()  + "\""
-                " --method "         + method                +
-                " --device "         + kDevice;
-            if (!RunScript("[vectorize]", cmd)) {
-                g_videoProcessing = false; return;
-            }
-        }
-
-        if (!g_videoProcessing) return;
-
-        // ── Stage 3: Encode ───────────────────────────────────────────────────
-        // For 'all' mode, run encode.py once per method JSON.
-        // For single methods, run once.
-        static const std::vector<std::string> kAllMethods = {"canny","hed"};
-        const std::vector<std::string> encMethods =
-            (method == "all") ? kAllMethods : std::vector<std::string>{method};
-
-        for (const auto& m : encMethods) {
-            if (!g_videoProcessing) break;
-
-            fs::path polyPath = polylinesDir / (maskTag + "_" + m + ".json");
-            fs::path animPath = animsDir     / (maskTag + "_" + m + ".ild");
-
-            if (!fs::exists(polyPath)) {
-                std::cout << "[encode] Skipping " << m
-                          << " (polylines file not found)\n" << std::flush;
-                continue;
-            }
-            std::string cmd =
-                kPython + " \"" + encScript.string()   + "\""
-                " --polylines \""  + polyPath.string() + "\""
-                " --output \""     + animPath.string() + "\"";
-            RunScript("[encode:" + m + "]", cmd);
-        }
-
-        if (!g_videoProcessing) return;
-
-        // ── Load and play ─────────────────────────────────────────────────────
-        // Priority order for 'all' mode: hed > canny
-        static const std::vector<std::string> kPlayPriority = {"hed","canny"};
-        const std::vector<std::string>& candidates =
-            (method == "all") ? kPlayPriority : encMethods;
-
-        std::vector<std::vector<HeliosPoint>> finalAnim;   // physically baked
-        std::string        finalName;
-        fs::path           finalPath;
-
-        for (const auto& m : candidates) {
-            fs::path animPath = animsDir / (maskTag + "_" + m + ".ild");
-            if (!fs::exists(animPath)) continue;
-            auto anim = ILDAFile::LoadFlat(animPath.string());
-            if (!anim.empty()) {
-                finalAnim = std::move(anim);
-                finalName = animPath.filename().string();
-                finalPath = animPath;
-                break;
-            }
-        }
-
-        if (finalAnim.empty()) {
-            std::cerr << "[sam2] No animation produced.\n";
-            g_videoProcessing = false;
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_animationMutex);
-            g_videoAnimationPhysical = std::move(finalAnim);
-            g_videoAnimation.clear();
-            g_videoBaked = true;
-        }
-        g_nowPlaying      = finalName;
-        g_videoProcessing = false;
-        g_videoReady      = true;
-        g_sceneIndex      = 7;
-
-        if (method == "all")
-            std::cout << "\n[sam2-all] Done — 2 ILDs in resources/animations/  "
-                         "type 'load' to switch between them.\n> " << std::flush;
-        else
-            std::cout << "[sam2] Playing " << finalName << "\n> " << std::flush;
-        return;
-    }
-
-}
+// The SAM2 pipeline runs as anonymous lambdas attached to g_videoThread
+// inside each command handler (process / segment / vectorize / encode).
 
 // -----------------------------------------------------------------------------
 // Render thread
@@ -446,45 +246,50 @@ void RenderThread(HeliosOutput& laser)
         if (g_sceneIndex == 7 && g_videoReady) {
             auto   now     = clock::now();
             double elapsed = std::chrono::duration<double>(now - lastAdvance).count();
-            double frameDt = 1.0 / g_config.target_fps;
+            // frameDt = base interval (1/target_fps) divided by speed multiplier.
+            // std::max guards against zero/negative speed → infinite frameDt.
+            float  spd     = std::max(0.01f, g_animationSpeed);
+            double frameDt = 1.0 / (g_config.target_fps * spd);
 
             if (elapsed >= frameDt) {
                 {
                     std::lock_guard<std::mutex> lock(g_animationMutex);
-                    int n = g_videoBaked
-                                ? static_cast<int>(g_videoAnimationPhysical.size())
-                                : static_cast<int>(g_videoAnimation.size());
+                    int n = static_cast<int>(g_videoAnimation.size());
                     if (n > 0) animFrame = (animFrame + 1) % n;
                 }
                 lastAdvance = now;
             }
 
             std::lock_guard<std::mutex> lock(g_animationMutex);
-            if (g_videoBaked) {
-                int n = static_cast<int>(g_videoAnimationPhysical.size());
-                if (n > 0) {
-                    const auto& frame = g_videoAnimationPhysical[animFrame % n];
-                    if (g_animationScale != 1.0f) {
-                        std::vector<HeliosPoint> scaled = frame;
-                        for (auto& p : scaled) {
-                            //scale around center 2048, 2048
-                            float cx = 2048.0f, cy = 2048.0f;
-                            p.x = static_cast<uint16_t>(std::clamp(cx + (p.x - cx) * g_animationScale, 0.0f, 4095.0f));
-                            p.y = static_cast<uint16_t>(std::clamp(cy + (p.y - cy) * g_animationScale, 0.0f, 4095.0f));
-                        }
-                        laser.SendPhysical(scaled);
-                    }
-                    else {
-                        laser.SendPhysical(frame);
-                    }
-                }
-                else {
-                    laser.SendFrame(alignCircle);
-                }
+            int n = static_cast<int>(g_videoAnimation.size());
+            if (n == 0) {
+                laser.SendFrame(alignCircle);
             } else {
-                int n = static_cast<int>(g_videoAnimation.size());
-                if (n > 0) laser.SendFrame(g_videoAnimation[animFrame % n]);
-                else       laser.SendFrame(alignCircle);
+                const float scale  = g_animationScale;
+                const float bright = g_animationBrightness;
+                const bool  modify = (scale != 1.0f) || (bright != 1.0f);
+                const auto& frame  = g_videoAnimation[animFrame % n];
+
+                if (modify) {
+                    std::vector<HeliosPoint> out = frame;
+                    for (auto& p : out) {
+                        if (scale != 1.0f) {
+                            // Scale around the centre of the 12-bit ILDA space.
+                            const float cx = 2048.0f, cy = 2048.0f;
+                            p.x = static_cast<uint16_t>(std::clamp(cx + (p.x - cx) * scale, 0.0f, 4095.0f));
+                            p.y = static_cast<uint16_t>(std::clamp(cy + (p.y - cy) * scale, 0.0f, 4095.0f));
+                        }
+                        if (bright != 1.0f) {
+                            p.r = static_cast<uint8_t>(std::clamp(p.r * bright, 0.0f, 255.0f));
+                            p.g = static_cast<uint8_t>(std::clamp(p.g * bright, 0.0f, 255.0f));
+                            p.b = static_cast<uint8_t>(std::clamp(p.b * bright, 0.0f, 255.0f));
+                            p.i = std::max(p.r, std::max(p.g, p.b));
+                        }
+                    }
+                    laser.SendPhysical(out);
+                } else {
+                    laser.SendPhysical(frame);
+                }
             }
         } else {
             // Circle: processing in progress, or user selected circle
@@ -503,9 +308,13 @@ void RenderThread(HeliosOutput& laser)
 
 void PrintConfig(const HeliosConfig& c)
 {
-    std::cout << "\n--- Config ---\n";
-    std::cout << std::fixed << std::setprecision(1);
-    std::cout << "  target_fps       = " << c.target_fps       << "\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\n--- Animation playback (applies to loaded .ild files) ---\n";
+    std::cout << "  target_fps       = " << c.target_fps           << "  (host upload cadence)\n";
+    std::cout << "  speed            = " << g_animationSpeed       << "  (multiplier; effective fps = target_fps * speed)\n";
+    std::cout << "  scale            = " << g_animationScale       << "\n";
+    std::cout << "  brightness       = " << g_animationBrightness  << "\n";
+    std::cout << "\n--- Live-scene tuning (alignment circle / SendFrame; no effect on .ild playback) ---\n";
     std::cout << "  max_pps          = " << c.max_pps          << "\n";
     std::cout << "  blank_points     = " << c.blank_points     << "\n";
     std::cout << "  pre_on_points    = " << c.pre_on_points    << "\n";
@@ -513,7 +322,8 @@ void PrintConfig(const HeliosConfig& c)
     std::cout << "  min_vertex_hold  = " << c.min_vertex_hold  << "\n";
     std::cout << "  max_vertex_hold  = " << c.max_vertex_hold  << "\n";
     std::cout << "  curve_threshold  = " << c.curve_threshold  << "\n";
-    std::cout << "--------------\n";
+    std::cout << "  reorder          = " << (c.enable_reorder ? "1" : "0") << "\n";
+    std::cout << "-------------------------------------------------\n";
 }
 
 void PrintMenu(const HeliosOutput& laser)
@@ -541,16 +351,42 @@ void PrintMenu(const HeliosOutput& laser)
     std::cout << "\n";
     std::cout << "  connect / disconnect\n\n";
     std::cout << "  --- SAM2 pipeline ---\n";
-    std::cout << "  process  <video> [prompt]         Full pipeline: segment + vectorize(all) + encode(all)\n";
+    std::cout << "  process  <video>                  Full pipeline: segment + vectorize(all) + encode(all)\n";
+    std::cout << "  process  <video> <prompt>         ... with Grounding DINO text prompt  e.g. process clip.mp4 person\n";
+    std::cout << "  process  <video> --interactive    ... with click-to-place SAM2 points on frame 0\n";
+    std::cout << "\n";
     std::cout << "  --- Individual stages ---\n";
-    std::cout << "  segment  <video> [prompt]        Stage 1: video -> masks  (cached)\n";
+    std::cout << "  segment  <video>                  Stage 1: video -> masks (blind 5-point grid)\n";
+    std::cout << "  segment  <video> <prompt>         Stage 1: video -> masks via Grounding DINO text query\n";
+    std::cout << "  segment  <video> --interactive    Stage 1: video -> masks via click prompting on frame 0\n";
+    std::cout << "                                      L-click=subject  R-click=background  U=undo  Enter=confirm\n";
     std::cout << "  preview-masks <video>             View segmentation masks\n";
+    std::cout << "\n";
     std::cout << "  vectorize <video> <method>        Stage 2: masks -> polylines\n";
     std::cout << "                                      method: canny | hed | edter | diffusion_edge\n";
     std::cout << "  preview-polylines <video> <method> View vectorized paths\n";
+    std::cout << "\n";
     std::cout << "  encode   <video> <method>         Stage 3: polylines -> ILDA + play\n\n";
+
+    std::cout << "  --- Parameters (set <param> <val>) ---\n";
+    std::cout << "    Animation playback (effective immediately on loaded .ild files):\n";
+    std::cout << "      target_fps     1..240        host upload cadence (Hz);\n"
+                 "                                   DAC firmware loops the buffered frame between uploads\n";
+    std::cout << "      speed          0.05..10     speed multiplier; effective fps = target_fps * speed\n";
+    std::cout << "      scale         -1..2          zoom around centre (negative = mirror)\n";
+    std::cout << "      brightness     0..1          colour multiplier\n";
+    std::cout << "\n";
+    std::cout << "    Live-scene tuning (alignment circle / SendFrame; NO effect on .ild playback):\n";
+    std::cout << "      max_pps         1000..60000   DAC point rate\n";
+    std::cout << "      blank_points    0..200        blank dwell at stroke boundaries\n";
+    std::cout << "      pre_on_points   0..100        illuminated dwell entering stroke\n";
+    std::cout << "      post_on_points  0..100        illuminated dwell exiting stroke\n";
+    std::cout << "      min_vertex_hold 0..100        min corner dwell\n";
+    std::cout << "      max_vertex_hold 0..200        max corner dwell\n";
+    std::cout << "      curve_threshold 0..180        bend angle threshold (deg)\n";
+    std::cout << "      reorder         0|1          enable nearest-neighbour reorder\n";
+    std::cout << "\n";
     std::cout << "  stop               back to circle\n";
-    std::cout << "  set <param> <val>  tune laser params\n";
     std::cout << "  config             show current config\n";
     std::cout << "  refresh            rescan resources/\n";
     std::cout << "  q                  quit\n";
@@ -620,9 +456,7 @@ int main()
             if (g_videoThread.joinable()) g_videoThread.join();
             g_videoReady = false;
             { std::lock_guard<std::mutex> lock(g_animationMutex);
-              g_videoAnimation.clear();
-              g_videoAnimationPhysical.clear();
-              g_videoBaked = false; }
+              g_videoAnimation.clear(); }
             g_sceneIndex  = 0;
             g_nowPlaying  = "alignment circle";
             std::cout << "Stopped.\n";
@@ -658,29 +492,15 @@ int main()
                 g_videoThread.join();
             }
 
-            // Auto-detect baked vs logical .ild and dispatch to the correct loader
-            bool baked = ILDAFile::IsBaked(path);
-            if (baked) {
-                auto anim = ILDAFile::LoadFlat(path);
-                if (anim.empty()) {
-                    std::cerr << "Failed to load (baked): " << path << "\n";
-                    PrintMenu(laser); continue;
-                }
-                std::lock_guard<std::mutex> lock(g_animationMutex);
-                g_videoAnimationPhysical = std::move(anim);
-                g_videoAnimation.clear();
-                g_videoBaked = true;
-            } else {
-                auto anim = ILDAFile::Load(path);
-                if (anim.empty()) {
-                    std::cerr << "Failed to load (logical): " << path << "\n";
-                    PrintMenu(laser); continue;
-                }
-                std::lock_guard<std::mutex> lock(g_animationMutex);
-                g_videoAnimation         = std::move(anim);
-                g_videoAnimationPhysical.clear();
-                g_videoBaked             = false;
+            // Per ILDA spec section 2.4, the file IS the point sequence the
+            // DAC will play.  We never re-bake it through BuildFrame.
+            auto anim = ILDAFile::Load(path);
+            if (anim.empty()) {
+                std::cerr << "Failed to load: " << path << "\n";
+                PrintMenu(laser); continue;
             }
+            std::lock_guard<std::mutex> lock(g_animationMutex);
+            g_videoAnimation = std::move(anim);
 
             g_nowPlaying = files[idx - 1].filename().string();
             g_videoReady = true;
@@ -739,7 +559,7 @@ int main()
             if (!prompt.empty() && prompt.front() == ' ') prompt = prompt.substr(1);
 
             if (videoPath.empty()) {
-                std::cerr << "Usage: process <video> [prompt]\n";
+                std::cerr << "Usage: process <video> [prompt | --interactive]\n";
                 PrintMenu(laser); continue;
             }
 
@@ -751,7 +571,7 @@ int main()
             fs::path ckptDir    = kProjectDir / "models"  / "sam2";
             fs::path gdinoModel = kProjectDir / "models"  / "gdino" /
                                   "groundingdino_swint_ogc.pth";
-            fs::path edterModel      = kProjectDir / "models" / "edter"          / "EDTER-BSDS-VOC-StageI.pth";
+            fs::path edterModel      = kProjectDir / "models" / "edter"          / "EDTER-BSDS-VOC-StageII.pth";
             fs::path diffEdgeModel   = kProjectDir / "models" / "diffusion_edge" / "bsds.pt";
             fs::path diffEdgeStage1  = kProjectDir / "models" / "diffusion_edge" / "first_stage_total_320.pt";
             fs::path diffEdgeConfig  = kProjectDir / "models" / "diffusion_edge" / "bsds_sample.yaml";
@@ -765,7 +585,9 @@ int main()
                 " --checkpoint-dir \"" + ckptDir.string()    + "\""
                 " --device "          + kSam2Device          +
                 " --gdino-model \""   + gdinoModel.string()  + "\"";
-            if (!prompt.empty())
+            if (prompt == "--interactive")
+                segCmd += " --interactive";
+            else if (!prompt.empty())
                 segCmd += " --prompt \"" + prompt + "\"";
 
             // vectorize --method all writes one JSON per method automatically
@@ -874,7 +696,7 @@ int main()
             if (!prompt.empty() && prompt.front() == ' ') prompt = prompt.substr(1);
 
             if (videoPath.empty()) {
-                std::cerr << "Usage: segment <video> [prompt]\n";
+                std::cerr << "Usage: segment <video> [prompt | --interactive]\n";
                 PrintMenu(laser); continue;
             }
 
@@ -894,7 +716,9 @@ int main()
                 " --checkpoint-dir \"" + ckptDir.string()  + "\""
                 " --device "          + kSam2Device        +
                 " --gdino-model \""   + gdinoModel.string()+ "\"";
-            if (!prompt.empty())
+            if (prompt == "--interactive")
+                cmd += " --interactive";
+            else if (!prompt.empty())
                 cmd += " --prompt \"" + prompt + "\"";
 
             if (g_videoThread.joinable()) {
@@ -973,7 +797,7 @@ int main()
             }
             fs::create_directories(polyPath.parent_path());
             fs::path vecScript      = kProjectDir / "scripts" / "vectorize.py";
-            fs::path edterModel     = kProjectDir / "models" / "edter"          / "EDTER-BSDS-VOC-StageI.pth";
+            fs::path edterModel     = kProjectDir / "models" / "edter"          / "EDTER-BSDS-VOC-StageII.pth";
             fs::path diffEdgeModel  = kProjectDir / "models" / "diffusion_edge" / "bsds.pt";
             fs::path diffEdgeStage1 = kProjectDir / "models" / "diffusion_edge" / "first_stage_total_320.pt";
             fs::path diffEdgeCfg    = kProjectDir / "models" / "diffusion_edge" / "bsds_sample.yaml";
@@ -1090,14 +914,11 @@ int main()
                         std::cout << buf << std::flush;
                     _pclose(pipe);
                 }
-                // encode.py always writes baked files now
-                auto anim = ILDAFile::LoadFlat(animPath.string());
+                auto anim = ILDAFile::Load(animPath.string());
                 if (!anim.empty()) {
                     {
                         std::lock_guard<std::mutex> lock(g_animationMutex);
-                        g_videoAnimationPhysical = std::move(anim);
-                        g_videoAnimation.clear();
-                        g_videoBaked             = true;
+                        g_videoAnimation = std::move(anim);
                     }
                     g_nowPlaying      = animPath.filename().string();
                     g_videoReady      = true;
@@ -1115,67 +936,75 @@ int main()
             continue;
         }
 
-        // Parameter tuning
+        // Parameter tuning — single dispatcher for every settable knob.
+        //
+        // Two semantic groups, both routed through `set <param> <value>`:
+        //
+        //   A) Real-time playback (applies immediately to baked-ILDA frames):
+        //        target_fps         — RenderThread's frame-advance rate (g_config)
+        //        scale / brightness / speed — animation-layer globals
+        //
+        //   B) Alignment-circle tuning (BuildFrame path only — NO effect on
+        //      baked .ild playback, which goes through SendPhysical and skips
+        //      BuildFrame entirely):
+        //        max_pps, blank_points, pre/post_on_points,
+        //        min/max_vertex_hold, curve_threshold, reorder
+        //
+        // Mutex policy: g_configMutex is held for the whole dispatch.  g_config
+        // writes need it (RenderThread reads g_config under the same lock when
+        // pushing SetConfig to HeliosOutput).  Animation-globals writes don't
+        // strictly need it (plain floats), but taking it unconditionally keeps
+        // the dispatcher uniform and avoids per-group branching.
         if (line.rfind("set ", 0) == 0) {
             std::istringstream ss(line.substr(4));
-            std::string param; float value;
-            if (!(ss >> param >> value)) {
+            std::string p; float v;
+            if (!(ss >> p >> v)) {
                 std::cout << "Usage: set <param> <value>\n";
                 PrintMenu(laser); continue;
             }
-            {
-                std::lock_guard<std::mutex> lock(g_configMutex);
-                bool found = true;
-                if      (param == "target_fps")     g_config.target_fps      = (int)value;
-                else if (param == "max_pps")         g_config.max_pps         = (int)value;
-                else if (param == "blank_points")    g_config.blank_points    = (int)value;
-                else if (param == "pre_on_points")   g_config.pre_on_points   = (int)value;
-                else if (param == "post_on_points")  g_config.post_on_points  = (int)value;
-                else if (param == "min_vertex_hold") g_config.min_vertex_hold = (int)value;
-                else if (param == "max_vertex_hold") g_config.max_vertex_hold = (int)value;
-                else if (param == "curve_threshold") g_config.curve_threshold = value;
-                else if (param == "reorder")         g_config.enable_reorder  = (value > 0.5f);
-                else { std::cout << "Unknown param: " << param << "\n"; found = false; }
-                if (found) { std::cout << "Set " << param << " = " << value << "\n";
-                             g_configDirty = true; }
+
+            std::lock_guard<std::mutex> lock(g_configMutex);
+
+            // Generic range-check helpers.  Return true if value was accepted
+            // (in range) and assigned to `field`.  On out-of-range, print a
+            // diagnostic and leave `field` untouched.
+            auto setInt = [&](float lo, float hi, int& field) -> bool {
+                if (v >= lo && v <= hi) { field = (int)v; return true; }
+                std::cout << "Range for " << p << ": [" << (int)lo
+                          << ", " << (int)hi << "]\n";
+                return false;
+            };
+            auto setFloat = [&](float lo, float hi, float& field) -> bool {
+                if (v >= lo && v <= hi) { field = v; return true; }
+                std::cout << "Range for " << p << ": [" << lo
+                          << ", " << hi << "]\n";
+                return false;
+            };
+
+            bool ok       = false;
+            bool isConfig = false;   // true → set g_configDirty to push SetConfig
+
+            // ── Group A: real-time playback ────────────────────────────────────
+            if      (p == "target_fps")      { ok = setInt  (1,    240,   g_config.target_fps);      isConfig = ok; }
+            else if (p == "scale")           { ok = setFloat(-1.0f, 2.0f, g_animationScale); }
+            else if (p == "brightness")      { ok = setFloat( 0.0f, 1.0f, g_animationBrightness); }
+            else if (p == "speed")           { ok = setFloat( 0.05f, 10.0f, g_animationSpeed); }
+            // ── Group B: alignment-circle (BuildFrame) tuning ──────────────────
+            else if (p == "max_pps")         { ok = setInt  (1000, 60000, g_config.max_pps);         isConfig = ok; }
+            else if (p == "blank_points")    { ok = setInt  (0,    200,   g_config.blank_points);    isConfig = ok; }
+            else if (p == "pre_on_points")   { ok = setInt  (0,    100,   g_config.pre_on_points);   isConfig = ok; }
+            else if (p == "post_on_points")  { ok = setInt  (0,    100,   g_config.post_on_points);  isConfig = ok; }
+            else if (p == "min_vertex_hold") { ok = setInt  (0,    100,   g_config.min_vertex_hold); isConfig = ok; }
+            else if (p == "max_vertex_hold") { ok = setInt  (0,    200,   g_config.max_vertex_hold); isConfig = ok; }
+            else if (p == "curve_threshold") { ok = setFloat(0.0f, 180.0f, g_config.curve_threshold); isConfig = ok; }
+            else if (p == "reorder")         { g_config.enable_reorder = (v > 0.5f); ok = true; isConfig = true; }
+            else                             { std::cout << "Unknown param: " << p << "\n"; }
+
+            if (ok) {
+                if (isConfig) g_configDirty = true;
+                std::cout << "Set " << p << " = " << v << "\n";
             }
             PrintMenu(laser); continue;
-        }
-
-        if (line.rfind("scale ", 0) == 0) {
-            try {
-                float val = std::stof(line.substr(6));
-                if (val >= -1.0f && val <= 2.0f) {
-                    g_animationScale = val;
-                    std::cout << "Set animation scale to " << g_animationScale << "\n";
-                }
-                else {
-                    std::cout << "Scale must be between -1 and 2.\n";
-                }
-            }
-            catch (...) {
-                std::cout << "Usage: scale [number from -1 to 2]\n";
-            }
-            PrintMenu(laser);
-            continue;
-        }
-
-        if (line.rfind("brightness ", 0) == 0) {
-            try {
-                float val = std::stof(line.substr(6));
-                if (val >= 0.0f && val <= 1.0f) {
-                    g_animationBrightness = val;
-                    std::cout << "Set animation brightness to " << g_animationBrightness << "\n";
-                }
-                else {
-                    std::cout << "Scale must be between 0 and 1.\n";
-                }
-            }
-            catch (...) {
-                std::cout << "Usage: scale [number from 0 to 1]\n";
-            }
-            PrintMenu(laser);
-            continue;
         }
 
         std::cout << "Unknown command.\n";

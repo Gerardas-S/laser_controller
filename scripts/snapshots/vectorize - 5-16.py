@@ -76,8 +76,6 @@ if platform.system() == "Windows":
         # best-effort; fall back to normal import behavior
         pass
 
-import os
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 # now safe to import torch and other modules
 import torch
 
@@ -120,9 +118,11 @@ def parse_args():
     p.add_argument('--diffusion-edge-first-stage-model', default='models/diffusion_edge/first_stage_total_320.pt')
     p.add_argument('--diffusion-edge-config',            default='models/diffusion_edge/bsds_sample.yaml')
     p.add_argument('--device',               default='cuda' if __import__('torch').cuda.is_available() else 'cpu', choices=['cpu', 'cuda'])
+    p.add_argument('--edge-video',          default='resources/polylines/',
+                   help='Optional output MP4 path or prefix for model edge-map video(s). '
+                        'If multiple methods are run, method suffixes are appended.')
     p.add_argument('--edge-video-fps',      type=float, default=None,
-                   help='Frame rate for cached edgemap MP4s in resources/edgemaps/. '
-                        'Defaults to source video fps.')
+                   help='Frame rate for edge-map output video(s). Defaults to source video fps.')
     # Outer contour
     p.add_argument('--min-area',        type=float, default=0.001,
                    help='Minimum mask area as fraction of frame area')
@@ -140,7 +140,7 @@ def parse_args():
                    help='approxPolyDP epsilon as fraction of image diagonal.')
     p.add_argument('--canny-min-pts',   type=int,   default=4)
     # HED  (gradient-mask → Steger ridge tracking → V-W simplify)
-    p.add_argument('--hed-sigma',         type=float, default=3.0,
+    p.add_argument('--hed-sigma',         type=float, default=1.0,
                    help='Gaussian smoothing σ for the Steger Hessian.  Should '
                         'be roughly the half-width of the ridges to detect.  '
                         '1.5 suits HED\'s ~1-2 pixel ridges; raise (2.0-3.0) '
@@ -155,7 +155,7 @@ def parse_args():
                    help='Max angle (degrees) between consecutive ridge-pixel '
                         'tangents during Steger linking.  Higher = walks '
                         'tolerate sharper bends; lower = stricter straightness.')
-    p.add_argument('--hed-mask-gain-high',type=float, default=1.5,
+    p.add_argument('--hed-mask-gain-high',type=float, default=1.0,
                    help='Gradient-mask filter: probability multiplier where image '
                         'gradient is strong.  Sharpens confident edges.')
     p.add_argument('--hed-mask-gain-mid', type=float, default=1.0,
@@ -166,7 +166,7 @@ def parse_args():
                         'gradient is weak.  0 kills dim edge continuations '
                         '(breaks continuity); 0.5 preserves them at half weight; '
                         '1.0 disables the gradient mask entirely.')
-    p.add_argument('--hed-link-kernel',   type=int,   default=7,
+    p.add_argument('--hed-link-kernel',   type=int,   default=10,
                    help='Max gap (pixels) for polyline-tip directional linking '
                         'after Steger.  1 = disabled.  Steger usually produces '
                         'continuous polylines on its own; this is a safety net '
@@ -218,7 +218,7 @@ def parse_args():
     # than HED's so strength_th is raised, link_kernel disabled by default,
     # mask_erode disabled by default since EDTER edges trace the silhouette
     # boundary precisely and erosion would kill them).
-    p.add_argument('--edter-sigma',         type=float, default=3.0,
+    p.add_argument('--edter-sigma',         type=float, default=4.0,
                    help='Gaussian smoothing σ for the Steger Hessian (px). '
                         'See --hed-sigma.')
     p.add_argument('--edter-strength',      type=float, default=0.005,
@@ -275,20 +275,16 @@ def parse_args():
                         'seams. uniform = simple average (legacy).')
 
 
-    # DiffusionEdge (skeleton-graph pipeline; see interior_skeleton_graph)
-    p.add_argument('--diffusion-edge-threshold',      type=float, default=0.0)
-    p.add_argument('--diffusion-edge-simplify-area',  type=float, default=1.0,
-                   help='Visvalingam-Whyatt min triangle area in px² '
-                        '(replaces the old approxPolyDP epsilon).')
-    p.add_argument('--diffusion-edge-min-pts',        type=int,   default=2)
-    p.add_argument('--diffusion-edge-min-len',        type=int,   default=15)
-    p.add_argument('--diffusion-edge-spread',         type=float, default=1.0,
+    # DiffusionEdge
+    p.add_argument('--diffusion-edge-threshold', type=float, default=0.35)
+    p.add_argument('--diffusion-edge-blur',      type=int,   default=3)
+    p.add_argument('--diffusion-edge-epsilon',   type=float, default=0.0007,
+                   help='approxPolyDP epsilon as fraction of image diagonal.')
+    p.add_argument('--diffusion-edge-min-pts',   type=int,   default=3)
+    p.add_argument('--diffusion-edge-min-len',   type=int,   default=40)
+    p.add_argument('--diffusion-edge-spread',    type=float, default=1.0,
                    help='Per-polyline intensity contrast modulator (see --hed-spread).')
-    p.add_argument('--diffusion-edge-junction-angle', type=float, default=30.0,
-                   help='Max deviation from straight (in degrees) accepted '
-                        'when greedily continuing a polyline through a junction. '
-                        '0 = always split at every junction; 90 = very permissive.')
-    p.add_argument('--diffusion-edge-steps',          type=int,   default=8,
+    p.add_argument('--diffusion-edge-steps',     type=int,   default=5,
                    help='Denoising steps for DiffusionEdge (fewer = faster, less crisp)')
     # Spline fitting (applied to all methods)
     p.add_argument('--spline-samples',  type=int,   default=1,
@@ -316,87 +312,86 @@ def parse_args():
 _ERODE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
 
 def _erode_mask(mask_u8):
-    inner = cv2.erode(mask_u8, _ERODE_KERNEL, iterations=0)
+    inner = cv2.erode(mask_u8, _ERODE_KERNEL, iterations=1)
     return inner if cv2.countNonZero(inner) > 0 else None
 
 
-#  ARCHIVED
-# def _nms_edge_map(prob_map):
-#     """Non-maximum suppression on a soft edge-probability map.
+def _nms_edge_map(prob_map):
+    """Non-maximum suppression on a soft edge-probability map.
 
-#     The map is treated as a ridge field: the gradient of the map points
-#     perpendicular to each edge ridge.  At every pixel we compare its value
-#     to the two neighbours along that gradient direction (quantised to 4
-#     directions: H, V, /, \\).  Pixels that are not local maxima along the
-#     gradient are zeroed.  The output is a thin (1-pixel-wide) ridge map
-#     that preserves the original float intensities at surviving pixels.
+    The map is treated as a ridge field: the gradient of the map points
+    perpendicular to each edge ridge.  At every pixel we compare its value
+    to the two neighbours along that gradient direction (quantised to 4
+    directions: H, V, /, \\).  Pixels that are not local maxima along the
+    gradient are zeroed.  The output is a thin (1-pixel-wide) ridge map
+    that preserves the original float intensities at surviving pixels.
 
-#     This is the right thin-ing operation for HED/EDTER output because it
-#     operates on the float map *before* any binary decision -- weak-but-real
-#     edges that would have been discarded by a hard threshold survive as
-#     long as they form a local ridge.
+    This is the right thin-ing operation for HED/EDTER output because it
+    operates on the float map *before* any binary decision -- weak-but-real
+    edges that would have been discarded by a hard threshold survive as
+    long as they form a local ridge.
 
-#     Input:  float32 [0, 1] of shape (H, W)
-#     Output: float32 [0, 1] of shape (H, W), thinned to single-pixel ridges.
-#     """
+    Input:  float32 [0, 1] of shape (H, W)
+    Output: float32 [0, 1] of shape (H, W), thinned to single-pixel ridges.
+    """
 
-#     # 1. Create a smoothed version ONLY for gradient calculation
-#     # This prevents 'jittery' directions without losing the raw peak values
-#     smoothed = cv2.GaussianBlur(prob_map, (5, 5), 0)
-#     smoothed = cv2.GaussianBlur(prob_map, (5, 5), 0)
+    # 1. Create a smoothed version ONLY for gradient calculation
+    # This prevents 'jittery' directions without losing the raw peak values
+    smoothed = cv2.GaussianBlur(prob_map, (5, 5), 0)
+    smoothed = cv2.GaussianBlur(prob_map, (5, 5), 0)
     
-#     # Use a larger Sobel kernel: gradient direction at the *peak* of a soft
-#     # ridge is dominated by noise with ksize=3 because the magnitude is
-#     # near zero there.  ksize=5 averages over a wider neighbourhood and
-#     # gives a stable perpendicular-to-ridge direction even at ridge tops.
-#     gx = cv2.Sobel(smoothed, cv2.CV_32F, 1, 0, ksize=5)
-#     gy = cv2.Sobel(smoothed, cv2.CV_32F, 0, 1, ksize=5)
-#     angle = np.arctan2(gy, gx)
-#     # Quantise to 4 directions: 0=H, 1=/, 2=V, 3=\
-#     q = (np.round(angle / (np.pi / 4)) % 4).astype(np.int8)
+    # Use a larger Sobel kernel: gradient direction at the *peak* of a soft
+    # ridge is dominated by noise with ksize=3 because the magnitude is
+    # near zero there.  ksize=5 averages over a wider neighbourhood and
+    # gives a stable perpendicular-to-ridge direction even at ridge tops.
+    gx = cv2.Sobel(smoothed, cv2.CV_32F, 1, 0, ksize=5)
+    gy = cv2.Sobel(smoothed, cv2.CV_32F, 0, 1, ksize=5)
+    angle = np.arctan2(gy, gx)
+    # Quantise to 4 directions: 0=H, 1=/, 2=V, 3=\
+    q = (np.round(angle / (np.pi / 4)) % 4).astype(np.int8)
 
-#     # Where the gradient is too weak to give a reliable direction (flat
-#     # plateaus, exact ridge tops) we skip suppression and keep the pixel
-#     # unconditionally if its value clears the threshold downstream.  This
-#     # preserves the centerline of wide soft ridges that would otherwise be
-#     # perforated by random-direction comparisons.
-#     gmag = cv2.magnitude(gx, gy)
-#     weak_grad = gmag < 1e-3
+    # Where the gradient is too weak to give a reliable direction (flat
+    # plateaus, exact ridge tops) we skip suppression and keep the pixel
+    # unconditionally if its value clears the threshold downstream.  This
+    # preserves the centerline of wide soft ridges that would otherwise be
+    # perforated by random-direction comparisons.
+    gmag = cv2.magnitude(gx, gy)
+    weak_grad = gmag < 1e-3
 
-#     p = prob_map
-#     out = np.zeros_like(p)
+    p = prob_map
+    out = np.zeros_like(p)
 
-#     # Asymmetric comparison (>= on one side, > on the other) ensures exactly
-#     # one pixel survives per flat plateau -- with strict > on both sides,
-#     # quantisation-induced plateaus suppress everything.
+    # Asymmetric comparison (>= on one side, > on the other) ensures exactly
+    # one pixel survives per flat plateau -- with strict > on both sides,
+    # quantisation-induced plateaus suppress everything.
 
-#     # Direction 0 (horizontal gradient -> vertical ridge): compare left/right
-#     m = (q == 0)
-#     keep = (p >= np.roll(p, 1, axis=1)) & (p > np.roll(p, -1, axis=1))
-#     out[m & keep] = p[m & keep]
+    # Direction 0 (horizontal gradient -> vertical ridge): compare left/right
+    m = (q == 0)
+    keep = (p >= np.roll(p, 1, axis=1)) & (p > np.roll(p, -1, axis=1))
+    out[m & keep] = p[m & keep]
 
-#     # Direction 1 (/ gradient): compare TL <-> BR
-#     m = (q == 1)
-#     keep = (p >= np.roll(np.roll(p, 1, axis=0), 1, axis=1)) & \
-#            (p >  np.roll(np.roll(p, -1, axis=0), -1, axis=1))
-#     out[m & keep] = p[m & keep]
+    # Direction 1 (/ gradient): compare TL <-> BR
+    m = (q == 1)
+    keep = (p >= np.roll(np.roll(p, 1, axis=0), 1, axis=1)) & \
+           (p >  np.roll(np.roll(p, -1, axis=0), -1, axis=1))
+    out[m & keep] = p[m & keep]
 
-#     # Direction 2 (vertical gradient -> horizontal ridge): compare up/down
-#     m = (q == 2)
-#     keep = (p >= np.roll(p, 1, axis=0)) & (p > np.roll(p, -1, axis=0))
-#     out[m & keep] = p[m & keep]
+    # Direction 2 (vertical gradient -> horizontal ridge): compare up/down
+    m = (q == 2)
+    keep = (p >= np.roll(p, 1, axis=0)) & (p > np.roll(p, -1, axis=0))
+    out[m & keep] = p[m & keep]
 
-#     # Direction 3 (\ gradient): compare TR <-> BL
-#     m = (q == 3)
-#     keep = (p >= np.roll(np.roll(p, 1, axis=0), -1, axis=1)) & \
-#            (p >  np.roll(np.roll(p, -1, axis=0), 1, axis=1))
-#     out[m & keep] = p[m & keep]
+    # Direction 3 (\ gradient): compare TR <-> BL
+    m = (q == 3)
+    keep = (p >= np.roll(np.roll(p, 1, axis=0), -1, axis=1)) & \
+           (p >  np.roll(np.roll(p, -1, axis=0), 1, axis=1))
+    out[m & keep] = p[m & keep]
 
-#     # Flat-top pixels: keep their value unconditionally
-#     out[weak_grad] = p[weak_grad]
+    # Flat-top pixels: keep their value unconditionally
+    out[weak_grad] = p[weak_grad]
 
-#     return out
-#  ARCHIVED
+    return out
+
 
 # -----------------------------------------------------------------------------
 # HED pipeline helpers
@@ -490,91 +485,70 @@ def _steger_ridge_points(soft_f32, sigma=1.5, strength_th=0.005):
     # This is the correct Steger formulation — do NOT use Sobel-of-Sobel,
     # which gives an incorrect rxy at diagonal orientations (≈45°) and
     # therefore wrong eigenvectors for curved edges such as circles.
-    # Memory-conscious implementation: explicitly free intermediates via
-    # `del` and use in-place arithmetic where safe.  A 700×1100 frame holds
-    # ~25 float32 maps at peak in the naive form (~75 MB); freeing aggressively
-    # keeps the working set below ~6 maps (~18 MB).
     gx_k, gy_k, gxx_k, gyy_k, gxy_k = _gaussian_derivative_kernels(sigma)
     rx  = cv2.filter2D(soft_f32, cv2.CV_32F, gx_k)
     ry  = cv2.filter2D(soft_f32, cv2.CV_32F, gy_k)
     rxx = cv2.filter2D(soft_f32, cv2.CV_32F, gxx_k)
     ryy = cv2.filter2D(soft_f32, cv2.CV_32F, gyy_k)
     rxy = cv2.filter2D(soft_f32, cv2.CV_32F, gxy_k)
-    del gx_k, gy_k, gxx_k, gyy_k, gxy_k
 
     # Closed-form 2x2 symmetric eigendecomposition.
-    half_trace = (rxx + ryy) * 0.5
-    det = rxx * ryy - rxy * rxy
-    disc = np.sqrt(np.maximum(0.0, half_trace * half_trace - det, out=det), out=det)
-    del det
-    lam_p = half_trace + disc
-    lam_m = half_trace - disc
-    del half_trace, disc
+    trace = rxx + ryy
+    det   = rxx * ryy - rxy * rxy
+    disc  = np.sqrt(np.maximum(0.0, (trace * 0.5) ** 2 - det))
+    lam_p = trace * 0.5 + disc        # algebraically larger eigenvalue
+    lam_m = trace * 0.5 - disc        # algebraically smaller eigenvalue
 
     # Pick the eigenvalue with greater absolute magnitude — that one's
-    # eigenvector is perpendicular to the ridge.  Bright ridges → negative.
+    # eigenvector is perpendicular to the ridge.  For bright ridges on
+    # a dark background the chosen one is negative.
     pick_p = np.abs(lam_p) > np.abs(lam_m)
-    lam_n = np.where(pick_p, lam_p, lam_m)
-    del lam_p, lam_m, pick_p
-    strength_full = -lam_n        # positive for bright ridges
+    lam_n  = np.where(pick_p, lam_p, lam_m)
+    strength_full = -lam_n             # positive for bright ridges
 
     # Eigenvector for lam_n: any non-zero column of (H - lam_n·I).
     # Use (lam_n - ryy, rxy); fall back to (rxy, lam_n - rxx) where
     # the first is degenerate, then to canonical basis when both are.
     nx_a = lam_n - ryy
-    norm_a = np.hypot(nx_a, rxy)
+    ny_a = rxy
+    norm_a = np.hypot(nx_a, ny_a)
+    nx_b = rxy
     ny_b = lam_n - rxx
-    norm_b = np.hypot(rxy, ny_b)
-    del lam_n
+    norm_b = np.hypot(nx_b, ny_b)
     use_a = norm_a >= norm_b
-    del norm_a, norm_b
-    nx_raw = np.where(use_a, nx_a, rxy)
-    ny_raw = np.where(use_a, rxy, ny_b)
-    del nx_a, ny_b, use_a
+    nx_raw = np.where(use_a, nx_a, nx_b)
+    ny_raw = np.where(use_a, ny_a, ny_b)
     n_norm = np.hypot(nx_raw, ny_raw)
-
     # Where both candidates collapsed (diagonal Hessian), pick canonical.
-    # Sparse mask: only assign at degenerate locations — no full-size
-    # np.where allocations.
     deg = n_norm < eps
     if np.any(deg):
-        rxx_dom_deg = np.abs(rxx[deg]) >= np.abs(ryy[deg])
-        nx_raw[deg] = rxx_dom_deg.astype(np.float32)
-        ny_raw[deg] = (~rxx_dom_deg).astype(np.float32)
-        n_norm[deg] = 1.0
-        del rxx_dom_deg
-    del deg
+        rxx_dom = np.abs(rxx) >= np.abs(ryy)
+        nx_raw = np.where(deg, np.where(rxx_dom, 1.0, 0.0), nx_raw)
+        ny_raw = np.where(deg, np.where(rxx_dom, 0.0, 1.0), ny_raw)
+        n_norm = np.where(deg, 1.0, n_norm)
     nx = nx_raw / n_norm
     ny = ny_raw / n_norm
-    del nx_raw, ny_raw, n_norm
     # Tangent perpendicular to n
     tx = -ny
-    ty = nx
+    ty =  nx
 
     # Sub-pixel ridge offset along n:
     #   p = -(rx·nx + ry·ny) / (rxx·nx² + 2·rxy·nx·ny + ryy·ny²)
     denom = rxx * nx * nx + 2.0 * rxy * nx * ny + ryy * ny * ny
-    del rxx, ryy, rxy
     numer = -(rx * nx + ry * ny)
-    del rx, ry
-    # Safe divide: substitute 1.0 at near-zero denominators, mask result after.
-    # One bool array reused — avoids the negate-twice peak.
-    denom_bad = np.abs(denom) <= eps
-    np.copyto(denom, 1.0, where=denom_bad)
-    p = numer / denom
-    del denom, numer
-    p[denom_bad] = 0.0
-    del denom_bad
+    # Safe divide (np.where evaluates both branches eagerly → divide-by-zero
+    # warning even when masked out).  Replace tiny denominators with 1.0
+    # before division and zero the result via the mask afterwards.
+    safe_denom = np.where(np.abs(denom) > eps, denom, 1.0)
+    p = np.where(np.abs(denom) > eps, numer / safe_denom, 0.0)
     off_x = p * nx
     off_y = p * ny
-    del p
 
     # Ridge condition: sub-pixel offset stays inside the pixel AND
     # ridge strength clears the floor.
     is_ridge = (np.abs(off_x) <= 0.5) & (np.abs(off_y) <= 0.5) & \
                (strength_full >= strength_th)
     ys, xs = np.where(is_ridge)
-    del is_ridge
     return (ys.astype(np.int32),
             xs.astype(np.int32),
             ys + off_y[ys, xs],
@@ -873,12 +847,7 @@ def _paths_to_polys(polylines, frame_w, frame_h, min_pts, simplify_area,
     {'path': [(x,y),...], 'closed': bool}, applies V-W simplification,
     samples per-vertex intensity from the float soft map, samples per-vertex
     color via Option D, normalizes to [-1, 1] with y-up, returns the JSON
-    dict format.
-
-    If a polyline carries a 'node_ids' field (e.g. from
-    interior_skeleton_graph: a 2-tuple of graph-node IDs at the first and
-    last pixel), it is propagated to the output dict so encode.py can
-    chain polylines that share a node with zero blanking."""
+    dict format."""
     out = []
     if edge_soft_f32 is not None:
         H, W = edge_soft_f32.shape[:2]
@@ -925,8 +894,7 @@ def _paths_to_polys(polylines, frame_w, frame_h, min_pts, simplify_area,
         out.append({'pts': normed,
                     'intensities': intensities,
                     'colors': colors,
-                    'closed': bool(pl.get('closed', False)),
-                    'node_ids': pl.get('node_ids')})
+                    'closed': bool(pl.get('closed', False))})
 
     if debug_prefix:
         _render_polys_to_png(out, frame_w, frame_h,
@@ -1135,345 +1103,77 @@ def interior_canny(mask_bool, gray_blended, frame_w, frame_h,
                               color_step=color_step, color_patch=color_patch)
 
 
-_SKEL_OFF8 = ((-1, -1), (-1, 0), (-1, 1),
-              ( 0, -1),          ( 0, 1),
-              ( 1, -1), ( 1, 0), ( 1, 1))
-
-
-def _skeleton_chains(skel_u8):
-    """Decompose a 1-pixel-wide skeleton into pixel chains and node positions.
-
-    skel_u8: HxW uint8, non-zero on skeleton pixels.
-    Returns
-      chains: list of dicts with
-                  'pixels':  ordered [(x, y), ...] including both end-node
-                             pixels (when they exist),
-                  'node_a':  int node id at chain[0]  (None for pure loops),
-                  'node_b':  int node id at chain[-1] (None for pure loops),
-                  'closed':  True only for node-free pixel loops.
-      nodes:  dict[int node_id, (x, y)]  -- endpoints (deg==1) and junctions (deg>=3).
+def interior_edgemap(mask_bool, edge_map, frame_w, frame_h,
+                     threshold, blur_k, epsilon, min_pts, min_len, spread,
+                     preprocess='diffusion_edge',
+                     threshold_high=None,
+                     bgr_frame=None, original_bgr=None,
+                     color_step=10, color_patch=5,
+                     debug_prefix=None):
     """
-    H, W = skel_u8.shape[:2]
-    skel = skel_u8 > 0
-    if not skel.any():
-        return [], {}
+    Interior edge extraction from a float [0,1] edge-probability map.
+    Used by EDTER and DiffusionEdge.  HED has its own dedicated pipeline
+    in `interior_steger_graph()` (sub-pixel ridge tracking; not routed through here).
+    EDTER also routes through `interior_steger_graph()` now; only DiffusionEdge
+    still uses this function.
 
-    # 8-neighbour degree via shifted-sum on a padded array.
-    pad = np.pad(skel.astype(np.uint8), 1, mode='constant')
-    deg = np.zeros((H, W), dtype=np.int32)
-    for dy, dx in _SKEL_OFF8:
-        deg += pad[1 + dy:H + 1 + dy, 1 + dx:W + 1 + dx]
-    deg = np.where(skel, deg, 0)
+    Common skeleton: erode mask -> [SEAM: map -> binary] -> AND with mask
+    -> findContours -> polylines.  Only the seam varies per model.
 
-    is_node = skel & ((deg == 1) | (deg >= 3))
+    preprocess='diffusion_edge':
+        Hard threshold only.  DiffusionEdge already outputs near-binary
+        single-pixel ridges, so no extra thinning is needed.
 
-    node_id = np.full((H, W), -1, dtype=np.int32)
-    nodes = {}
-    ys, xs = np.nonzero(is_node)
-    for y, x in zip(ys.tolist(), xs.tolist()):
-        nid = len(nodes)
-        node_id[y, x] = nid
-        nodes[nid] = (int(x), int(y))
-
-    def neighbours(y, x):
-        out = []
-        for dy, dx in _SKEL_OFF8:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < H and 0 <= nx < W and skel[ny, nx]:
-                out.append((ny, nx))
-        return out
-
-    chains = []
-    visited_edges = set()
-
-    def ek(y1, x1, y2, x2):
-        a, b = (y1, x1), (y2, x2)
-        return (a, b) if a < b else (b, a)
-
-    # Walk every chain starting from each node, along each of its skeleton neighbours.
-    for ny, nx in zip(ys.tolist(), xs.tolist()):
-        for sy, sx in neighbours(ny, nx):
-            k0 = ek(ny, nx, sy, sx)
-            if k0 in visited_edges:
-                continue
-            visited_edges.add(k0)
-            path = [(nx, ny), (sx, sy)]
-            py, px = ny, nx
-            cy, cx = sy, sx
-            end_node = None
-            while True:
-                if node_id[cy, cx] >= 0:
-                    end_node = int(node_id[cy, cx])
-                    break
-                nxt = None
-                for ny2, nx2 in neighbours(cy, cx):
-                    if (ny2, nx2) == (py, px):
-                        continue
-                    k1 = ek(cy, cx, ny2, nx2)
-                    if k1 in visited_edges:
-                        continue
-                    nxt = (ny2, nx2, k1)
-                    break
-                if nxt is None:
-                    break
-                ny2, nx2, k1 = nxt
-                visited_edges.add(k1)
-                py, px = cy, cx
-                cy, cx = ny2, nx2
-                path.append((nx2, ny2))
-            chains.append({
-                'pixels': path,
-                'node_a': int(node_id[ny, nx]),
-                'node_b': end_node,
-                'closed': False,
-            })
-
-    # Pure-loop components: connected regular-only pixels (no nodes).
-    # Any skel pixel that didn't participate in a chain above belongs to one.
-    pixel_seen = np.zeros((H, W), dtype=bool)
-    for c in chains:
-        for (x, y) in c['pixels']:
-            pixel_seen[y, x] = True
-    rys, rxs = np.nonzero(skel & ~pixel_seen)
-    loop_seen = np.zeros((H, W), dtype=bool)
-    for y0, x0 in zip(rys.tolist(), rxs.tolist()):
-        if loop_seen[y0, x0]:
-            continue
-        path = [(int(x0), int(y0))]
-        loop_seen[y0, x0] = True
-        py, px = -1, -1
-        cy, cx = int(y0), int(x0)
-        while True:
-            pick = None
-            for ny, nx in neighbours(cy, cx):
-                if (ny, nx) == (py, px):
-                    continue
-                if loop_seen[ny, nx]:
-                    if (nx, ny) == (x0, y0) and len(path) > 2:
-                        pick = (ny, nx)
-                    continue
-                pick = (ny, nx)
-                break
-            if pick is None:
-                break
-            ny, nx = pick
-            if (nx, ny) == (x0, y0):
-                break
-            loop_seen[ny, nx] = True
-            path.append((int(nx), int(ny)))
-            py, px = cy, cx
-            cy, cx = ny, nx
-        if len(path) >= 3:
-            chains.append({
-                'pixels': path,
-                'node_a': None,
-                'node_b': None,
-                'closed': True,
-            })
-
-    return chains, nodes
-
-
-def _chain_tangent(pixels, end='head', k=5):
-    """Unit tangent at one end of a chain, pointing FROM that end INTO the chain."""
-    n = len(pixels)
-    if n < 2:
-        return (0.0, 0.0)
-    k = min(k, n - 1)
-    if end == 'head':
-        ax, ay = pixels[0]
-        bx, by = pixels[k]
-    else:
-        ax, ay = pixels[-1]
-        bx, by = pixels[-1 - k]
-    dx, dy = bx - ax, by - ay
-    norm = math.hypot(dx, dy)
-    if norm == 0.0:
-        return (0.0, 0.0)
-    return (dx / norm, dy / norm)
-
-
-def _eulerian_decompose(chains, nodes, junction_angle_deg, tangent_k=5):
-    """Greedy graph traversal: emit one polyline per traversed sub-path,
-    selecting at each junction the unused incident chain whose tangent is
-    most anti-parallel to the one we just left with.  Closed-loop chains
-    are emitted directly.  Each polyline carries the node ids of its first
-    and last pixel (or None where no node exists)."""
-    # Precompute tangents at both ends of every node-bounded chain.
-    tan_a = [None] * len(chains)
-    tan_b = [None] * len(chains)
-    for ci, c in enumerate(chains):
-        if c.get('closed'):
-            continue
-        tan_a[ci] = _chain_tangent(c['pixels'], end='head', k=tangent_k)
-        tan_b[ci] = _chain_tangent(c['pixels'], end='tail', k=tangent_k)
-
-    # node_id -> list of (chain_idx, 'a'|'b')
-    incidence = {nid: [] for nid in nodes}
-    for ci, c in enumerate(chains):
-        if c.get('closed'):
-            continue
-        if c['node_a'] is not None:
-            incidence[c['node_a']].append((ci, 'a'))
-        if c['node_b'] is not None:
-            incidence[c['node_b']].append((ci, 'b'))
-
-    # Accept a continuation at a junction iff dot(prev_tan, next_tan) <= cos_th,
-    # where both tangents point INTO their chain from the shared junction.
-    # Straight continuation -> dot == -1.  junction_angle_deg is the max
-    # tolerated deviation from straight.
-    cos_th = -math.cos(math.radians(junction_angle_deg))
-
-    visited = [False] * len(chains)
-    polylines = []
-
-    # Emit closed-loop chains as standalone polylines.
-    for ci, c in enumerate(chains):
-        if c.get('closed') and not visited[ci]:
-            visited[ci] = True
-            polylines.append({
-                'path':     list(c['pixels']),
-                'closed':   True,
-                'node_ids': (None, None),
-            })
-
-    def pick_start_node():
-        odd = junc_even = any_node = None
-        for nid, edges in incidence.items():
-            d = sum(1 for ci, _ in edges if not visited[ci])
-            if d == 0:
-                continue
-            if d % 2 == 1:
-                if odd is None:
-                    odd = nid
-            elif d >= 4:
-                if junc_even is None:
-                    junc_even = nid
-            else:
-                if any_node is None:
-                    any_node = nid
-        return odd if odd is not None else (junc_even if junc_even is not None else any_node)
-
-    def directed_pixels(ci, start_end):
-        pixs = chains[ci]['pixels']
-        return pixs if start_end == 'a' else list(reversed(pixs))
-
-    def tangent_at(ci, end):
-        return tan_a[ci] if end == 'a' else tan_b[ci]
-
-    while True:
-        start = pick_start_node()
-        if start is None:
-            break
-        cands = sorted((ci, e) for ci, e in incidence[start] if not visited[ci])
-        if not cands:
-            break
-        ci, end = cands[0]
-        path = []
-        node_first = start
-        node_last = start
-        while True:
-            visited[ci] = True
-            seg = directed_pixels(ci, end)
-            if path:
-                path.extend(seg[1:])
-            else:
-                path.extend(seg)
-            far = 'b' if end == 'a' else 'a'
-            cur_node = chains[ci]['node_a'] if far == 'a' else chains[ci]['node_b']
-            if cur_node is None:
-                node_last = None
-                break
-            node_last = cur_node
-            cur_tan = tangent_at(ci, far)
-            best = None
-            best_dot = float('inf')
-            for ci2, e2 in incidence[cur_node]:
-                if visited[ci2]:
-                    continue
-                t2 = tangent_at(ci2, e2)
-                if t2 is None or cur_tan is None:
-                    continue
-                d = cur_tan[0] * t2[0] + cur_tan[1] * t2[1]
-                if d < best_dot:
-                    best_dot = d
-                    best = (ci2, e2)
-            if best is None or best_dot > cos_th:
-                break
-            ci, end = best
-        polylines.append({
-            'path':     path,
-            'closed':   False,
-            'node_ids': (node_first, node_last),
-        })
-
-    return polylines
-
-
-def interior_skeleton_graph(mask_bool, edge_map, frame_w, frame_h,
-                            threshold, simplify_area,
-                            min_pts, min_len, spread,
-                            junction_angle_deg=30.0,
-                            bgr_frame=None,
-                            color_step=10, color_patch=5,
-                            debug_prefix=None):
-    """Skeleton-graph vectorization for sharp edge maps (DiffusionEdge).
-
-    Pipeline:
-      [1] Threshold the soft map and AND with the eroded SAM2 mask.
-      [2] Zhang-Suen thinning -> 1-pixel-wide skeleton.
-      [3] Classify pixels (endpoint / regular / junction) from 8-neighbour
-          counts on the skeleton.
-      [4] Walk regular pixels between endpoint/junction nodes to extract
-          pixel chains.
-      [5] Greedy traversal: at every junction pick the unused incident
-          chain whose tangent is most anti-parallel to the one just left,
-          emitting one polyline per sub-path.  Start nodes prioritise odd
-          degree (path endpoints) then junctions (deg>=4 even) so polyline
-          endpoints land on shared graph nodes whenever possible -- which
-          lets encode.py chain adjacent polylines with zero blanking.
-      [6] Hand pixel-path polylines + node id pairs to _paths_to_polys for
-          V-W simplify, intensity/color sampling, and [-1, 1] normalisation.
-
-    Each output polyline carries 'node_ids': (first_node_id, last_node_id),
-    or (None, None) for closed loops with no graph node.
+    preprocess='edter':
+        NMS on the soft float map (before any threshold).  EDTER outputs
+        moderately wide soft ridges; NMS collapses them to 1-pixel-wide
+        skeletons while preserving the float intensity at the ridge centre.
+        A single threshold then acts as a noise-floor kill.
     """
     inner = _erode_mask(mask_bool.astype(np.uint8) * 255)
     if inner is None:
         return []
 
-    edge_float = np.clip(edge_map, 0.0, 1.0).astype(np.float32)
+    # Keep a high-precision float copy of the raw map for NMS.  The u8 cast
+    # below quantises to 256 levels, which creates plateaus that break NMS
+    # tie-breaking; NMS must run on the original floats.
+    edge_float_raw = np.clip(edge_map, 0.0, 1.0).astype(np.float32)
+    edge_u8        = (edge_float_raw * 255).astype(np.uint8)
     if debug_prefix:
-        cv2.imwrite(f'{debug_prefix}_01_edge_u8.png',
-                    (edge_float * 255).astype(np.uint8))
+        cv2.imwrite(f'{debug_prefix}_01_edge_u8.png', edge_u8)
 
-    # [1] Threshold + mask
-    binary = (edge_float > threshold).astype(np.uint8) * 255
+    # ── seam: probability map -> binary ──────────────────────────────────
+    if preprocess == 'edter':
+        # NMS only, single threshold acts as noise-floor kill.
+        thinned_f = _nms_edge_map(edge_float_raw)
+        if debug_prefix:
+            cv2.imwrite(f'{debug_prefix}_03_nms.png',
+                        (thinned_f * 255).astype(np.uint8))
+        binary = (thinned_f > threshold).astype(np.uint8) * 255
+        edge_u8 = (thinned_f * 255).astype(np.uint8)
+
+    else:  # 'diffusion_edge'
+        binary = (edge_u8 > int(threshold * 255)).astype(np.uint8) * 255
+    if debug_prefix:
+        cv2.imwrite(f'{debug_prefix}_04_preprocessed.png', binary)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # Dilate the binary edge map slightly to preserve edges near the mask boundary
+    # that might otherwise be cut off by the bitwise_and with the eroded inner mask.
+    #dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    #binary = cv2.dilate(binary, dilate_kernel, iterations=1)
+
     binary = cv2.bitwise_and(binary, inner)
     if debug_prefix:
-        cv2.imwrite(f'{debug_prefix}_02_threshold + mask.png', binary)
+        cv2.imwrite(f'{debug_prefix}_05_masked.png', binary)
 
-    # [2] Zhang-Suen skeletonization (1-pixel-wide centerlines).
-    skel = cv2.ximgproc.thinning(binary,
-                                  thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
-    if debug_prefix:
-        cv2.imwrite(f'{debug_prefix}_03_Zhang-Suen skeletonization.png', skel)
-
-    # [3] + [4] Pixel chains between endpoint/junction nodes.
-    chains, nodes = _skeleton_chains(skel)
-    if not chains:
-        return []
-
-    # [5] Eulerian-style greedy decomposition.
-    poly_paths = _eulerian_decompose(chains, nodes, junction_angle_deg)
-
-    # [6] Reuse the shared post-processing tail.
-    return _paths_to_polys(poly_paths, frame_w, frame_h,
-                           min_pts, simplify_area, min_len,
-                           edge_soft_f32=edge_float, spread=spread,
-                           bgr_frame=bgr_frame, mask=mask_bool,
-                           color_step=color_step, color_patch=color_patch,
-                           debug_prefix=debug_prefix)
+    cnts, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    return _contours_to_polys(cnts, frame_w, frame_h, min_pts, epsilon,
+                              closed=False, edge_map=edge_u8, spread=spread,
+                              min_len=min_len,
+                              bgr_frame=bgr_frame, mask=mask_bool,
+                              color_step=color_step, color_patch=color_patch,
+                              debug_prefix=debug_prefix)
 
 
 def interior_steger_graph(mask_bool, soft_f32, frame_w, frame_h,
@@ -1526,7 +1226,7 @@ def interior_steger_graph(mask_bool, soft_f32, frame_w, frame_h,
     bgr_frame_for_mask: Original BGR frame used by the gradient-mask filter
                         for image-gradient computation (HED only).
 
-    Returns the same JSON polyline dict list as interior_skeleton_graph().
+    Returns the same JSON polyline dict list as interior_edgemap().
     """
     mask_u8 = mask_bool.astype(np.uint8) * 255
 
@@ -1800,6 +1500,7 @@ def main():
     _diag = math.sqrt(frame_w ** 2 + frame_h ** 2)
     args.smooth_epsilon          = args.smooth_epsilon          * _diag
     args.canny_epsilon           = args.canny_epsilon           * _diag
+    args.diffusion_edge_epsilon  = args.diffusion_edge_epsilon  * _diag
 
     print(f'[vectorize] Masks: {total_frames} frames  ({frame_w}x{frame_h})'
           f'  diagonal={_diag:.0f}px  '
@@ -1855,42 +1556,37 @@ def main():
     if fps is None or fps <= 0 or np.isnan(fps):
         fps = 30.0
 
-    # -----------------------------------------------------------------------
-    # Edgemap inference cache — resources/edgemaps/{stem}_{method}_edgemap.mp4
-    # If the file already exists for a method, inference is skipped and frames
-    # are read from the cached video instead (mirrors resources/masks/ layout).
-    # -----------------------------------------------------------------------
-    _video_stem  = os.path.splitext(os.path.basename(args.video))[0]
-    _edgemap_dir = 'resources/edgemaps'
-    os.makedirs(_edgemap_dir, exist_ok=True)
+    edge_video_writers = {}
+    if args.edge_video:
+        base_path = args.edge_video
+        as_dir = False
+        if base_path.endswith(os.sep) or base_path.endswith('/') or os.path.isdir(base_path):
+            as_dir = True
+            os.makedirs(base_path, exist_ok=True)
+        else:
+            parent_dir = os.path.dirname(base_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
 
-    edge_cache_paths = {
-        m: os.path.join(_edgemap_dir, f'{_video_stem}_{m}_edgemap.mp4')
-        for m in ('canny', 'hed', 'edter', 'diffusion_edge')
-    }
-
-    edge_video_caps    = {}  # method → VideoCapture  (read from cache)
-    edge_cache_writers = {}  # method → VideoWriter    (write new cache)
-
-    for _m, _cache_path in edge_cache_paths.items():
-        if _m not in methods:
-            continue
-        if os.path.exists(_cache_path):
-            _cap_c = cv2.VideoCapture(_cache_path)
-            if _cap_c.isOpened():
-                edge_video_caps[_m] = _cap_c
-                print(f'[vectorize] Cache hit  — {_m} edgemap: {_cache_path}', flush=True)
-                continue
-            _cap_c.release()
-        # Cache miss — open a writer so this run populates the cache
-        try:
-            edge_cache_writers[_m] = _make_video_writer(
-                _cache_path, frame_w, frame_h,
-                float(args.edge_video_fps) if args.edge_video_fps is not None else float(fps))
-            print(f'[vectorize] Cache miss — {_m} edgemap will be cached to {_cache_path}',
-                  flush=True)
-        except Exception as _e:
-            print(f'[vectorize] Warning: cannot create cache writer for {_m}: {_e}', flush=True)
+        for m in methods:
+            if as_dir:
+                path = os.path.join(base_path, f'{args.video}_{m}_edgemap.mp4')
+            else:
+                base, ext = os.path.splitext(base_path)
+                if ext.lower() == '.mp4' and len(methods) > 1:
+                    path = base + f'_{m}_edgemap.mp4'
+                elif ext.lower() == '.mp4':
+                    path = base_path
+                else:
+                    path = base_path + f'_{m}_edgemap.mp4'
+            try:
+                edge_video_writers[m] = _make_video_writer(
+                    path, frame_w, frame_h,
+                    float(args.edge_video_fps) if args.edge_video_fps is not None else float(fps))
+                print(f'[vectorize] Edge-map video enabled: {m} → {path}', flush=True)
+            except Exception as e:
+                print(f'[vectorize] Warning: failed to create edge-map writer for {m}: {e}', flush=True)
+                edge_video_writers[m] = None
 
     # -------------------------------------------------------------------------
     # Per-method frame storage
@@ -1940,44 +1636,32 @@ def main():
                 m = alpha * m + (1.0 - alpha) * prev_map
             return m, m
 
-        def _load_or_infer(method_key, runner, bgr_frame, prev_map, mask=None):
-            """Return (edge_map, new_prev).
+        hed_map,            prev_hed            = _run_and_blend(hed_runner,            bgr, prev_hed,            mask)
+        edter_map,          prev_edter          = _run_and_blend(edter_runner,          bgr, prev_edter,          mask)
+        diffusion_edge_map, prev_diffusion_edge = _run_and_blend(diffusion_edge_runner, bgr, prev_diffusion_edge, mask)
 
-            If a cached edgemap VideoCapture exists for method_key, read the
-            next frame from it (temporal blending is already baked in — do NOT
-            re-apply).  Otherwise run live inference via _run_and_blend and
-            write the result to the cache VideoWriter if one is open.
-            """
-            cap_c = edge_video_caps.get(method_key)
-            if cap_c is not None:
-                ret, cached_bgr = cap_c.read()
-                if ret:
-                    # _edge_map_to_bgr writes grayscale-as-BGR; reverse it.
-                    em = cached_bgr[:, :, 0].astype(np.float32) / 255.0
-                    return em, em
-                # Frame read failed (count mismatch) — fall through to inference
-            new_map, new_prev = _run_and_blend(runner, bgr_frame, prev_map, mask)
-            writer_c = edge_cache_writers.get(method_key)
-            if writer_c is not None and new_map is not None:
-                writer_c.write(_edge_map_to_bgr(new_map))
-            return new_map, new_prev
-
-        hed_map,            prev_hed            = _load_or_infer('hed',            hed_runner,            bgr, prev_hed,            mask)
-        edter_map,          prev_edter          = _load_or_infer('edter',          edter_runner,          bgr, prev_edter,          mask)
-        diffusion_edge_map, prev_diffusion_edge = _load_or_infer('diffusion_edge', diffusion_edge_runner, bgr, prev_diffusion_edge, mask)
-
-        # Canny edgemap cache — Canny has no runner, so _load_or_infer never
-        # touches it.  Compute inline (matching interior_canny preprocessing)
-        # and write to resources/edgemaps/ when canny is in this run's methods
-        # and no cached video already exists.
-        if 'canny' in edge_cache_writers:
-            cimg = np.clip(gray, 0, 255).astype(np.uint8)
-            if args.canny_blur > 1:
-                ck = args.canny_blur | 1
-                cimg = cv2.GaussianBlur(cimg, (ck, ck), 0)
-            canny_map = cv2.Canny(cimg, args.canny_low,
-                                  args.canny_high).astype(np.float32) / 255.0
-            edge_cache_writers['canny'].write(_edge_map_to_bgr(canny_map))
+        if edge_video_writers:
+            for method_name, writer in edge_video_writers.items():
+                if writer is None:
+                    continue
+                if method_name == 'canny':
+                    # Canny isn't run by a runner upstream — compute it inline,
+                    # matching interior_canny()'s preprocessing exactly.
+                    cimg = np.clip(gray, 0, 255).astype(np.uint8)
+                    if args.canny_blur > 1:
+                        ck = args.canny_blur | 1
+                        cimg = cv2.GaussianBlur(cimg, (ck, ck), 0)
+                    edge_map = cv2.Canny(cimg, args.canny_low,
+                                         args.canny_high).astype(np.float32) / 255.0
+                else:
+                    edge_map = {
+                        'hed': hed_map,
+                        'edter': edter_map,
+                        'diffusion_edge': diffusion_edge_map,
+                    }.get(method_name)
+                frame_img = _edge_map_to_bgr(edge_map)
+                if frame_img is not None:
+                    writer.write(frame_img)
 
         # --- Save raw model output for frame 0 (visual inspection) ---
         if frame_idx == 0:
@@ -2066,21 +1750,21 @@ def main():
                     color_patch=args.color_patch,
                     debug_prefix=dbg)
             elif m == 'diffusion_edge' and diffusion_edge_map is not None:
-                interior = interior_skeleton_graph(
+                interior = interior_edgemap(
                     mask, diffusion_edge_map, frame_w, frame_h,
-                    args.diffusion_edge_threshold,
-                    args.diffusion_edge_simplify_area,
-                    args.diffusion_edge_min_pts,
+                    args.diffusion_edge_threshold, args.diffusion_edge_blur,
+                    args.diffusion_edge_epsilon, args.diffusion_edge_min_pts,
                     args.diffusion_edge_min_len,
                     args.diffusion_edge_spread,
-                    junction_angle_deg=args.diffusion_edge_junction_angle,
+                    preprocess='diffusion_edge',
                     bgr_frame=bgr_frame_arg,
+                    original_bgr=bgr,
                     color_step=args.color_step,
                     color_patch=args.color_patch,
                     debug_prefix=dbg)
 
-            frame_polys = outer + interior
-            #frame_polys = interior # Steger algorithm removes the need for SAM2 mask contour to be included in the final result
+            #frame_polys = outer + interior
+            frame_polys = interior # Steger algorithm removes the need for SAM2 mask contour to be included in the final result
             frame_polys = apply_spline_fitting(frame_polys, args.spline_samples)
             frames_by_method[m][frame_idx] = frame_polys
 
@@ -2097,11 +1781,9 @@ def main():
                   f'polylines={len(sample)}  pts={pts}', flush=True)
 
     cap.release()
-    for _c in edge_video_caps.values():
-        _c.release()
-    for _w in edge_cache_writers.values():
-        if _w is not None:
-            _w.release()
+    for writer in edge_video_writers.values():
+        if writer is not None:
+            writer.release()
 
     # -------------------------------------------------------------------------
     # Save one JSON per method

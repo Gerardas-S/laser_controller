@@ -120,7 +120,12 @@ def parse_ilda(path: str):
                 break
 
             fmt   = hdr[7]
-            count = struct.unpack('>H', hdr[8:10])[0]
+            # Per ILDA spec Rev 011 §4.1: number-of-records lives at bytes
+            # 25-26 (Python offset 24:26), NOT bytes 9-10 (which is the
+            # frame-name field).  Reading the wrong offset previously read
+            # the first 2 ASCII chars of the name as a huge count and the
+            # parser would walk past EOF on every file.
+            count = struct.unpack('>H', hdr[24:26])[0]
             # count == 0 is the ILDA EOF marker
             if count == 0:
                 break
@@ -284,7 +289,10 @@ class Viewer:
         sl_x = 130
         sl_w = W - sl_x - 200
         sl_y = CANVAS_H + 30
-        self.slider = Slider(sl_x, sl_y, sl_w, t=_pps_to_t(1000))
+        # Default slider position is PPS_MAX so the simulator preview matches
+        # the real hardware: HeliosOutput::CalculatePPS sends every frame at
+        # max PPS, and the firmware auto-loops between RenderThread uploads.
+        self.slider = Slider(sl_x, sl_y, sl_w, t=_pps_to_t(PPS_MAX))
 
     def _init_state(self):
         self.frames     = []

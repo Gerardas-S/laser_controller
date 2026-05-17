@@ -75,7 +75,101 @@ def parse_args():
                    help='GroundingDINO box confidence threshold [0,1]')
     p.add_argument('--text-threshold',  type=float, default=0.25,
                    help='GroundingDINO text confidence threshold [0,1]')
+    p.add_argument('--gdino-select',    default='union',
+                   choices=['best', 'largest', 'union'],
+                   help='How to select from multiple GDINO candidates: '
+                        'best=highest confidence (old default), '
+                        'largest=biggest bounding box area, '
+                        'union=merge all candidates into one box (default).')
+    # Interactive point selection (overrides --prompt)
+    p.add_argument('--interactive',     action='store_true',
+                   help='Show frame 0 in a window and collect SAM2 point prompts '
+                        'by clicking.  Left=subject (green), right=background '
+                        '(red), U=undo, Enter=confirm, Esc=cancel.  Takes '
+                        'priority over --prompt.')
     return p.parse_args()
+
+
+# =============================================================================
+# Interactive point selection — show frame 0, collect SAM2 point prompts
+# =============================================================================
+
+def interactive_point_select(frame_bgr):
+    """
+    Open an OpenCV window on frame 0 and collect SAM2 point prompts.
+
+    Controls
+    --------
+      Left  click : add subject  point (label 1, green)
+      Right click : add background point (label 0, red)
+      U / u       : undo last point
+      Enter       : confirm and proceed
+      Esc         : cancel (caller falls back to blind grid)
+
+    Returns
+    -------
+    (points, labels) : (np.float32 [N, 2], np.int32 [N]) on success
+    (None, None)     : on cancel or no positive points
+    """
+    points = []   # list of (x, y, label)  label: 1=subject  0=background
+    win    = ('SAM2 point prompt - L:subject  R:background  '
+              'U:undo  Enter:confirm  Esc:cancel')
+
+    def _redraw():
+        img = frame_bgr.copy()
+        # Black instruction bar at the top
+        cv2.rectangle(img, (0, 0), (img.shape[1], 32), (0, 0, 0), -1)
+        cv2.putText(img,
+                    'L=subject  R=background  U=undo  Enter=confirm  Esc=cancel',
+                    (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        # Bottom-left point counter
+        n_pos = sum(1 for _, _, l in points if l == 1)
+        n_neg = sum(1 for _, _, l in points if l == 0)
+        cv2.putText(img, f'+{n_pos}  -{n_neg}',
+                    (6, img.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
+                    cv2.LINE_AA)
+        for (x, y, lbl) in points:
+            color = (0, 220, 0) if lbl == 1 else (0, 0, 220)
+            cv2.circle(img, (x, y), 7, color, -1)
+            cv2.circle(img, (x, y), 7, (255, 255, 255), 2)
+        cv2.imshow(win, img)
+
+    def _on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            points.append((x, y, 1))
+            _redraw()
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            points.append((x, y, 0))
+            _redraw()
+
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(win, _on_mouse)
+    _redraw()
+
+    cancelled = False
+    while True:
+        key = cv2.waitKey(20) & 0xFF
+        if key in (13, 10):           # Enter / LF
+            break
+        if key == 27:                 # Esc
+            cancelled = True
+            break
+        if key in (ord('u'), ord('U')):
+            if points:
+                points.pop()
+                _redraw()
+
+    cv2.destroyWindow(win)
+    cv2.waitKey(1)   # let the window actually close on some platforms
+
+    if cancelled or not points or not any(l == 1 for _, _, l in points):
+        return None, None
+
+    pts_arr = np.array([[x, y] for x, y, _ in points], dtype=np.float32)
+    lbl_arr = np.array([l for _, _, l in points], dtype=np.int32)
+    return pts_arr, lbl_arr
 
 
 # =============================================================================
@@ -83,9 +177,15 @@ def parse_args():
 # =============================================================================
 
 def gdino_locate(frame_bgr, prompt, gdino_model_path, gdino_config_path,
-                 box_threshold, text_threshold, device):
+                 box_threshold, text_threshold, device,
+                 select='union', debug_path=None):
     """
     Run Grounding DINO on one frame.
+
+    select     : 'best'    — highest-confidence candidate
+                 'largest' — largest bounding-box area
+                 'union'   — axis-aligned union of all candidates
+    debug_path : if given, save an annotated JPEG showing all candidates.
 
     Returns
     -------
@@ -164,18 +264,63 @@ def gdino_locate(frame_bgr, prompt, gdino_model_path, gdino_config_path,
     boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes) * \
                  torch.tensor([w, h, w, h], dtype=torch.float32)
     scores     = logits.squeeze(-1) if logits.dim() > 1 else logits
+    boxes_np   = boxes_xyxy.cpu().numpy()   # [N, 4]
+    scores_np  = scores.cpu().numpy()
 
-    best_idx   = scores.argmax().item()
-    best_box   = boxes_xyxy[best_idx].cpu().numpy()   # [x1,y1,x2,y2] pixels
-    best_score = float(scores[best_idx])
+    # --- always print all candidates so user can see what was found ---
+    print(f'[segment] GroundingDINO: {len(boxes_np)} candidate(s) for "{prompt}":',
+          flush=True)
+    for ci, (b, s) in enumerate(zip(boxes_np, scores_np)):
+        print(f'  [{ci}]  box=[{b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}]  '
+              f'conf={float(s):.3f}  phrase="{phrases[ci] if ci < len(phrases) else "?"}"',
+              flush=True)
 
-    print(f'[segment] GroundingDINO: "{prompt}"  '
-          f'box=[{best_box[0]:.0f},{best_box[1]:.0f},'
-          f'{best_box[2]:.0f},{best_box[3]:.0f}]  '
-          f'conf={best_score:.3f}  '
-          f'({len(boxes)} candidate(s))', flush=True)
+    # --- box selection ---
+    if select == 'union':
+        chosen_box = np.array([
+            boxes_np[:, 0].min(),
+            boxes_np[:, 1].min(),
+            boxes_np[:, 2].max(),
+            boxes_np[:, 3].max(),
+        ], dtype=np.float32)
+        chosen_score = float(scores_np.max())
+    elif select == 'largest':
+        areas   = (boxes_np[:, 2] - boxes_np[:, 0]) * (boxes_np[:, 3] - boxes_np[:, 1])
+        idx     = int(areas.argmax())
+        chosen_box   = boxes_np[idx].astype(np.float32)
+        chosen_score = float(scores_np[idx])
+    else:  # 'best'
+        idx          = int(scores_np.argmax())
+        chosen_box   = boxes_np[idx].astype(np.float32)
+        chosen_score = float(scores_np[idx])
 
-    return best_box.astype(np.float32), best_score
+    print(f'[segment] Selected ({select}): '
+          f'box=[{chosen_box[0]:.0f},{chosen_box[1]:.0f},'
+          f'{chosen_box[2]:.0f},{chosen_box[3]:.0f}]  '
+          f'conf={chosen_score:.3f}', flush=True)
+
+    # --- debug image: all candidates in blue, chosen box in green ---
+    if debug_path is not None:
+        dbg = frame_bgr.copy()
+        for ci, (b, s) in enumerate(zip(boxes_np, scores_np)):
+            x1, y1, x2, y2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+            cv2.rectangle(dbg, (x1, y1), (x2, y2), (255, 100, 0), 2)
+            cv2.putText(dbg, f'{ci} {float(s):.2f}',
+                        (x1, max(0, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 100, 0), 1,
+                        cv2.LINE_AA)
+        cx1, cy1 = int(chosen_box[0]), int(chosen_box[1])
+        cx2, cy2 = int(chosen_box[2]), int(chosen_box[3])
+        cv2.rectangle(dbg, (cx1, cy1), (cx2, cy2), (0, 255, 0), 3)
+        cv2.putText(dbg, f'chosen ({select})',
+                    (cx1, max(0, cy1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2,
+                    cv2.LINE_AA)
+        os.makedirs(os.path.dirname(os.path.abspath(debug_path)), exist_ok=True)
+        cv2.imwrite(debug_path, dbg)
+        print(f'[segment] GDINO debug image → {debug_path}', flush=True)
+
+    return chosen_box, chosen_score
 
 
 # =============================================================================
@@ -250,17 +395,42 @@ def main():
         # -------------------------------------------------------------------------
         # Determine SAM2 prompt
         # -------------------------------------------------------------------------
-        use_box    = False
-        prompt_box = None   # [x1, y1, x2, y2] pixels
+        use_box       = False
+        use_points    = False
+        prompt_box    = None   # [x1, y1, x2, y2] pixels
+        prompt_points = None
+        prompt_labels = None
 
-        if args.prompt:
+        # Priority chain: --interactive > --prompt > blind 5-point grid
+        if args.interactive:
+            print('[segment] Interactive mode — click points on frame 0  '
+                  '(L=subject  R=background  U=undo  Enter=confirm  Esc=cancel)',
+                  flush=True)
+            pts, lbls = interactive_point_select(frame0_bgr)
+            if pts is not None:
+                use_points    = True
+                prompt_points = pts
+                prompt_labels = lbls
+                n_pos = int((lbls == 1).sum())
+                n_neg = int((lbls == 0).sum())
+                print(f'[segment] Interactive: collected {n_pos} positive + '
+                      f'{n_neg} negative point(s)', flush=True)
+            else:
+                print('[segment] Interactive: cancelled or no positive points — '
+                      'falling back to 5-point grid prompt.', flush=True)
+
+        elif args.prompt:
             print(f'[segment] Text prompt: "{args.prompt}"  '
                   f'— running Grounding DINO on frame 0 ...', flush=True)
+            debug_img = os.path.splitext(
+                os.path.abspath(args.output))[0] + '_gdino_boxes.jpg'
             box, conf = gdino_locate(
                 frame0_bgr, args.prompt,
                 args.gdino_model, args.gdino_config,
                 args.box_threshold, args.text_threshold,
-                args.device)
+                args.device,
+                select=args.gdino_select,
+                debug_path=debug_img)
             if box is not None:
                 use_box    = True
                 prompt_box = box
@@ -268,7 +438,7 @@ def main():
                 print('[segment] Grounding DINO returned no box — '
                       'falling back to 5-point grid prompt.', flush=True)
 
-        if not use_box:
+        if not use_box and not use_points:
             cx, cy = frame_w // 2, frame_h // 2
             prompt_points = np.array([
                 [cx,               cy              ],
