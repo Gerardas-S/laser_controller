@@ -118,6 +118,17 @@ def parse_args():
                         'straight edges still get a handful of samples for '
                         'color interpolation.')
 
+    # Per-frame point budget (projector viability)
+    p.add_argument('--scan-rate', type=int, default=30_000,
+                   help='Projector max points per second (default 30000).  '
+                        'Combined with --fps to derive per-frame point budget.')
+    p.add_argument('--fps',       type=int, default=30,
+                   help='Playback frame rate used to derive per-frame budget '
+                        '(default 30).  budget = scan_rate // fps.')
+    p.add_argument('--max-pts',   type=int, default=0,
+                   help='Direct per-frame point budget override.  '
+                        '0 (default) = derive from scan-rate / fps.')
+
     return p.parse_args()
 
 
@@ -164,6 +175,61 @@ def _polyline_length(pts):
     for i in range(1, len(pts)):
         total += _dist(pts[i - 1], pts[i])
     return total
+
+
+def _estimate_poly_cost(p, args):
+    """
+    Estimate the ILDA point count for one logical polyline dict.
+
+    Converts to 12-bit and runs _curvature_resample for an exact drawing-point
+    count, then adds fixed per-stroke overhead (travel + blank dwells + pre/post
+    on).  Corner dwells are omitted — small second-order effect, keeps estimate
+    conservative (actual cost ≥ estimate is the safe direction for filtering).
+    """
+    xy     = [_norm_to_ilda12(pt[0], pt[1]) for pt in p['pts']]
+    cs     = p.get('colors', [[1.0, 1.0, 1.0]] * len(p['pts']))
+    pts_rs = _curvature_resample(xy, cs, args.max_accel, args.min_spacing,
+                                 args.max_spacing)
+    n_draw = len(pts_rs)
+    fixed  = (args.min_travel_points
+              + 2 * args.blank_points
+              + args.pre_on_points
+              + args.post_on_points)
+    return n_draw + fixed
+
+
+def _select_polylines_for_budget(frame_polys, budget, args):
+    """
+    Greedy knapsack: keep the most visually important polylines that fit within
+    `budget` estimated ILDA points for the frame.
+
+    Importance score = arc length in 12-bit units × 10 for outer=True polylines
+    (SAM2 silhouette), × 1 otherwise.  Original frame order is restored in the
+    returned list so downstream chaining/TSP sees a consistent sequence.
+    """
+    if not frame_polys or budget <= 0:
+        return frame_polys
+
+    scored = []
+    for p in frame_polys:
+        cost = _estimate_poly_cost(p, args)
+        xy   = [_norm_to_ilda12(pt[0], pt[1]) for pt in p['pts']]
+        arc  = sum(_dist(xy[i], xy[i + 1]) for i in range(len(xy) - 1))
+        score = arc * (10.0 if p.get('outer', False) else 1.0)
+        scored.append((score, cost, p))
+
+    scored.sort(key=lambda x: -x[0])   # highest importance first
+
+    kept, total = [], 0
+    for _score, cost, p in scored:
+        if total + cost <= budget:
+            kept.append(p)
+            total += cost
+
+    # Restore original frame order
+    orig_idx = {id(p): i for i, p in enumerate(frame_polys)}
+    kept.sort(key=lambda p: orig_idx[id(p)])
+    return kept
 
 
 def _quint_ease(t):
@@ -765,6 +831,10 @@ def main():
     # The animation loops, so frame 0's entry travel comes from the LAST
     # frame's exit position.
 
+    budget = args.max_pts if args.max_pts > 0 else args.scan_rate // args.fps
+    print(f'[encode] Point budget: {budget} pts/frame  '
+          f'(scan_rate={args.scan_rate}  fps={args.fps})', flush=True)
+
     centre = (2048.0, 2048.0)
 
     def _prepare_supers(frame_polys, prev_end):
@@ -795,19 +865,31 @@ def main():
     # steady-state playback is exact.
     physical_frames = []
     prev_end = centre
+    n_dropped_total = 0
     for frame_polys in filtered:
         if not frame_polys:
             physical_frames.append([])
             continue
+        n_before = len(frame_polys)
+        frame_polys = _select_polylines_for_budget(frame_polys, budget, args)
+        n_dropped_total += n_before - len(frame_polys)
         supers = _prepare_supers(frame_polys, prev_end)
         physical, prev_end = _build_natural_frame(supers, prev_end, args)
         physical_frames.append(physical)
+
+    if n_dropped_total:
+        print(f'[encode] Budget filter dropped {n_dropped_total} polylines '
+              f'across all frames to stay within {budget} pts/frame.', flush=True)
 
     # ── 3. Write ILDA ─────────────────────────────────────────────────────────
     total_pts = sum(len(p) for p in physical_frames)
     print(f'[encode] Writing ILDA: {len(physical_frames)} frames  '
           f'{total_pts} total physical points '
           f'(avg {total_pts // max(1, len(physical_frames))}/frame)', flush=True)
+    over_budget = sum(1 for p in physical_frames if len(p) > budget)
+    if over_budget:
+        print(f'[encode] WARNING: {over_budget} frame(s) still exceed {budget} pts '
+              f'(corner-dwell overhead — within expected margin).', flush=True)
 
     write_ilda_physical(args.output, physical_frames)
 

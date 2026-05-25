@@ -5,10 +5,3 @@ accelerate>=0.24.0
 onnx>=1.15.0
 onnxconverter-common>=1.14.0
 safetensors>=0.4.0
-einops>=0.6.0
-timm==0.6.12
-fvcore
-ema-pytorch
-omegaconf>=2.3.0
-scipy
-opencv-contrib-python>=4.5.0

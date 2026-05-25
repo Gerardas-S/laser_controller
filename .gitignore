@@ -31,6 +31,14 @@ scripts/output/*
 !scripts/output/.gitkeep
 scripts/cache/
 
+# Pipeline generated artefacts — regenerable from sources, do not track
+resources/cache/
+resources/debug/
+resources/edgemaps/
+resources/polylines/
+resources/animations/
+resources/masks/
+
 # Deep learning model files
 *.onnx
 *.pt
@@ -84,13 +92,21 @@ desktop.ini
 __pycache__/
 venv/
 env/
-.venv/
+
+#Claude
+
+.claude/
+.claude/worktrees/*
+
+#Helios
 
 HELIOS_FIRMWARE/
 HELIOS_HARDWARE/
 
-.claude/
+#OTHER
 
 resources/
+scripts/.vscode/
 
-MUSIC_PIPELINE_INTEGRATON.txt
+
+.venv/

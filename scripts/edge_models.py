@@ -21,7 +21,7 @@ That's it.
 Models present
 --------------
     HEDRunner            — Holistically-Nested Edge Detection (Xie & Tu, 2015)       PyTorch
-    EDTERRunner          — Edge Detection with Transformer (Pu et al., CVPR 2022)    PyTorch
+    NBEDRunner           — A New Baseline for Edge Detection (Ze et al., 2024)        PyTorch
     DiffusionEdgeRunner  — Diffusion-based Edge Detection (Ye et al., AAAI 2024)     PyTorch
 """
 
@@ -229,1005 +229,235 @@ class HEDRunner:
 
 
 # =============================================================================
-# EDTER — Edge Detection with Transformer (Pu et al., CVPR 2022)
-# https://github.com/MengyangPu/EDTER
+# NBED — A New Baseline for Edge Detection (arXiv 2024)
+# https://github.com/Bin-ze/NBED   (cloned at models/NBED-main)
 #
-# Stage I: ViT-Large/16 backbone with Bidirectional Multi-Layer Aggregation
-# (BIMLA) at transformer layers 5, 11, 17, 23.  Sliding-window inference at
-# 320×320 (stride 280).  ODS 0.820 on BSDS500.
-#
-# Stage II adds a local ViT-Base/8 branch (160×160 crops) fused via SFT.
-# When a Stage II checkpoint is supplied, this runner extracts the Stage I
-# global_model sub-weights and runs them at Stage I quality.  Full Stage II
-# two-branch inference is not implemented.
-#
-# Pure PyTorch — no mmcv dependency.  Uses models/edter/EDTER-BSDS-VOC-StageI.pth.
+# Single-pass full-frame CNN+Transformer (CAFormer-M36 with optional Dynamic
+# Up-sampling Layer encoder, UNet++-style decoder, default conv head).
+# No sliding window, no tiling, no fusion stages — runs in one forward.
+# Pure PyTorch + timm; uses the official model code from models/NBED-main/
+# verbatim (we don't reimplement classes).
+# Weights: models/nbed/NBED-BIPED.pth (recommended for laser projection per
+# the NBED README — BIPED-trained checkpoints emit cleaner long contours
+# than BSDS-trained ones, which suits the downstream Steger thinner.)
 # =============================================================================
 
-# ---------------------------------------------------------------------------
-# Lazy builder: creates all EDTER nn.Module classes on first use so that
-# torch/nn are not imported at module load time (matches the rest of this file).
-# ---------------------------------------------------------------------------
-
-_edter_stage1_cls = None  # cached once built
-_edter_stage2_cls = None  # cached once built
+_nbed_cls         = None    # cached Basemodel class after first build
+_nbed_runtime_pkg = None    # cached `model.*` package once sys.path is wired
 
 
-def _build_edter_stage1():
-    """Instantiate _EDTER_Stage1; imports torch/nn on first call."""
-    global _edter_stage1_cls
-    if _edter_stage1_cls is None:
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
+def _build_nbed_model():
+    """Instantiate the official NBED Basemodel. Lazy: imports torch/timm/NBED
+    on first call only. Returns (model_class, model_instance_factory)."""
+    global _nbed_cls, _nbed_runtime_pkg
+    if _nbed_cls is not None:
+        return _nbed_cls
 
-        # ── ViT primitive blocks ──────────────────────────────────────────
+    import sys as _s, os as _o
 
-        class _Attn(nn.Module):
-            def __init__(self, dim, num_heads):
-                super().__init__()
-                self.num_heads = num_heads
-                self.head_dim  = dim // num_heads
-                self.scale     = self.head_dim ** -0.5
-                self.qkv  = nn.Linear(dim, dim * 3)
-                self.proj = nn.Linear(dim, dim)
+    # NBED's source uses the legacy timm import path; alias to the modern one
+    # before any NBED module imports.
+    import timm.layers.helpers as _modern_helpers
+    _s.modules.setdefault('timm.models.layers.helpers', _modern_helpers)
 
-            def forward(self, x):
-                B, N, C = x.shape
-                qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
-                                           self.head_dim).permute(2, 0, 3, 1, 4)
-                q, k, v = qkv.unbind(0)
-                attn = (q @ k.transpose(-2, -1)) * self.scale
-                attn = attn.softmax(dim=-1)
-                x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-                return self.proj(x)
+    nbed_root = _o.path.normpath(_o.path.join(
+        _o.path.dirname(_o.path.abspath(__file__)), '..', 'models', 'NBED-main'))
+    if nbed_root not in _s.path:
+        _s.path.insert(0, nbed_root)
 
-        class _Mlp(nn.Module):
-            def __init__(self, dim, ratio=4.):
-                super().__init__()
-                hid = int(dim * ratio)
-                self.fc1 = nn.Linear(dim, hid)
-                self.fc2 = nn.Linear(hid, dim)
+    # NBED's get_encoder() hard-codes pretrained=True, which triggers a load
+    # of model/caformer_m36_384_in21ft1k.pth (the ImageNet pretrained file).
+    # Our BIPED checkpoint already carries every encoder weight, so we
+    # monkey-patch to flip pretrained=False — avoids requiring the extra
+    # ImageNet file on disk and skips a ~360 MB load we'd overwrite anyway.
+    from model import utils as _nbed_utils
 
-            def forward(self, x):
-                return self.fc2(F.gelu(self.fc1(x)))
+    def _get_encoder_no_pretrained(nm, Dulbrn=16):
+        nu = nm.upper()
+        if nu == 'DUL-M36':
+            from model.caformer import caformer_m36_384_in21ft1k
+            return caformer_m36_384_in21ft1k(pretrained=False, Dulbrn=Dulbrn)
+        if nu == 'CAFORMER-M36':
+            from model.caformer import caformer_m36_384_in21ft1k
+            return caformer_m36_384_in21ft1k(pretrained=False)
+        if nu == 'DUL-S18':
+            from model.caformer import caformer_s18_384_in21ft1k
+            return caformer_s18_384_in21ft1k(pretrained=False, Dulbrn=Dulbrn)
+        raise ValueError(f'Unsupported NBED encoder {nm!r}')
 
-        class _Block(nn.Module):
-            def __init__(self, dim, num_heads):
-                super().__init__()
-                self.norm1 = nn.LayerNorm(dim)
-                self.attn  = _Attn(dim, num_heads)
-                self.norm2 = nn.LayerNorm(dim)
-                self.mlp   = _Mlp(dim)
+    _nbed_utils.get_encoder = _get_encoder_no_pretrained
 
-            def forward(self, x):
-                x = x + self.attn(self.norm1(x))
-                x = x + self.mlp(self.norm2(x))
-                return x
-
-        # ── Patch embedding ───────────────────────────────────────────────
-
-        class _PatchEmbed(nn.Module):
-            """Key: patch_embed.proj.*"""
-            def __init__(self, patch_size=16, in_ch=3, embed_dim=1024):
-                super().__init__()
-                self.proj = nn.Conv2d(in_ch, embed_dim,
-                                      kernel_size=patch_size, stride=patch_size)
-
-            def forward(self, x):
-                return self.proj(x).flatten(2).transpose(1, 2)  # [B, N, E]
-
-        # ── BIMLA (Bidirectional Multi-Layer Aggregation) ─────────────────
-        # Keys: mla_p{2..5}_1x1.{0,1}  mla_p{2..5}.{0,1}  mla_b{2..5}.{0,1}
-        # Each entry is nn.Sequential(Conv2d, BN2d).
-
-        class _MLA(nn.Module):
-            def __init__(self, in_ch=1024, mla_ch=256):
-                super().__init__()
-                # Each sub-module is Conv → BN → ReLU, matching the official
-                # Conv_BIMLA in mmseg/models/backbones/vit_bimla.py.  The
-                # trailing ReLU is required for the trained downstream head
-                # to see the activation distribution it was trained on; the
-                # earlier (ReLU-less) reimpl propagated negative activations
-                # that drove the final sigmoid to zero in BN-eval mode.
-                # ReLU is parameter-free so state_dict keys are unchanged.
-                def _seq1x1():
-                    return nn.Sequential(
-                        nn.Conv2d(in_ch, mla_ch, 1, bias=False),
-                        nn.BatchNorm2d(mla_ch),
-                        nn.ReLU(inplace=True),
-                    )
-                def _seq3x3():
-                    return nn.Sequential(
-                        nn.Conv2d(mla_ch, mla_ch, 3, padding=1, bias=False),
-                        nn.BatchNorm2d(mla_ch),
-                        nn.ReLU(inplace=True),
-                    )
-                # 1×1 projections
-                self.mla_p2_1x1 = _seq1x1()
-                self.mla_p3_1x1 = _seq1x1()
-                self.mla_p4_1x1 = _seq1x1()
-                self.mla_p5_1x1 = _seq1x1()
-                # Forward (top-down) path
-                self.mla_p2 = _seq3x3()
-                self.mla_p3 = _seq3x3()
-                self.mla_p4 = _seq3x3()
-                self.mla_p5 = _seq3x3()
-                # Backward (bottom-up) path
-                self.mla_b2 = _seq3x3()
-                self.mla_b3 = _seq3x3()
-                self.mla_b4 = _seq3x3()
-                self.mla_b5 = _seq3x3()
-
-            def forward(self, feats):
-                # feats = [f2, f3, f4, f5] each [B, in_ch, H, W]
-                # where f2=shallowest (layer 5), f5=deepest (layer 23).
-                # Per official Conv_BIMLA.forward (vit_bimla.py:213-244):
-                # the p-path / b-path conv inputs are *skip-additions of the
-                # 1×1 projections only* — NOT cascades through prior 3×3 conv
-                # outputs.  The earlier (cascade) reimpl quadruple-convolved
-                # the shallowest feature, producing values the trained
-                # downstream head was never exposed to.
-                e2 = self.mla_p2_1x1(feats[0])
-                e3 = self.mla_p3_1x1(feats[1])
-                e4 = self.mla_p4_1x1(feats[2])
-                e5 = self.mla_p5_1x1(feats[3])
-
-                # Top-down: each level sums all 1×1 outputs at/below it
-                p4_plus = e5 + e4
-                p3_plus = p4_plus + e3
-                p2_plus = p3_plus + e2
-
-                mla_p5 = self.mla_p5(e5)
-                mla_p4 = self.mla_p4(p4_plus)
-                mla_p3 = self.mla_p3(p3_plus)
-                mla_p2 = self.mla_p2(p2_plus)
-
-                # Bottom-up: each level sums all 1×1 outputs at/above it
-                b3_plus = e2 + e3
-                b4_plus = b3_plus + e4
-                b5_plus = b4_plus + e5
-
-                mla_b2 = self.mla_b2(e2)
-                mla_b3 = self.mla_b3(b3_plus)
-                mla_b4 = self.mla_b4(b4_plus)
-                mla_b5 = self.mla_b5(b5_plus)
-
-                # Official return order: (b2..b5, p2..p5).  The downstream
-                # mlahead's head{2..5} takes the P-features, head{2..5}_1
-                # takes the B-features.
-                return [mla_b2, mla_b3, mla_b4, mla_b5,
-                        mla_p2, mla_p3, mla_p4, mla_p5]
-
-        # ── VIT-BIMLA backbone ────────────────────────────────────────────
-        # Keys: cls_token, pos_embed, patch_embed.*, blocks.N.*, norm_{0..3}.*, mla.*
-
-        class _VIT_BIMLA(nn.Module):
-            # ViT-Large/16 with BIMLA, tapped at transformer layers 5,11,17,23
-            MLA_IDX = (5, 11, 17, 23)
-
-            def __init__(self, img_size=320, patch_size=16, embed_dim=1024,
-                         num_heads=16, depth=24, mla_ch=256):
-                super().__init__()
-                n_patches = (img_size // patch_size) ** 2
-                self.patch_embed = _PatchEmbed(patch_size, 3, embed_dim)
-                self.cls_token   = nn.Parameter(torch.zeros(1, 1, embed_dim))
-                self.pos_embed   = nn.Parameter(
-                    torch.zeros(1, n_patches + 1, embed_dim))
-                self.blocks = nn.ModuleList(
-                    [_Block(embed_dim, num_heads) for _ in range(depth)])
-                for i in range(4):
-                    setattr(self, f'norm_{i}', nn.LayerNorm(embed_dim))
-                self.mla = _MLA(embed_dim, mla_ch)
-
-            def forward(self, x):
-                B, _, H, W = x.shape
-                x = self.patch_embed(x)
-                cls = self.cls_token.expand(B, -1, -1)
-                x   = torch.cat([cls, x], dim=1)
-                x   = x + self.pos_embed
-
-                feats = []
-                ni = 0
-                for i, blk in enumerate(self.blocks):
-                    x = blk(x)
-                    if i in self.MLA_IDX:
-                        norm = getattr(self, f'norm_{ni}')
-                        feats.append(norm(x))
-                        ni += 1
-
-                # Remove cls token and reshape to [B, embed_dim, ph, pw]
-                ph, pw = H // 16, W // 16
-                spatial = []
-                for f in feats:
-                    s = f[:, 1:, :].permute(0, 2, 1).reshape(B, -1, ph, pw)
-                    spatial.append(s)
-                return self.mla(spatial)  # list of 8 × [B, 256, ph, pw]
-
-        # ── VIT-BIMLAHead decode head ─────────────────────────────────────
-        # Keys: mlahead.head{2..5}{,_1}.{0,1,3,4}, global_features.*, edge.*, conv_seg.*
-
-        def _mla_branch(in_ch=256, out_ch=128):
-            # Two-step transposed conv: 20→80 (×4) then 80→320 (×4)
-            # k=4, s=4, p=0 for step1; k=16, s=4, p=6 for step2
-            return nn.Sequential(
-                nn.ConvTranspose2d(in_ch,  out_ch, 4,  stride=4, padding=0, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.ConvTranspose2d(out_ch, out_ch, 16, stride=4, padding=6, bias=False),
-                nn.BatchNorm2d(out_ch),
-            )
-
-        class _MLAHead(nn.Module):
-            def __init__(self, mla_ch=256, out_ch=128):
-                super().__init__()
-                # forward path (top-down): head2..head5
-                self.head2   = _mla_branch(mla_ch, out_ch)
-                self.head3   = _mla_branch(mla_ch, out_ch)
-                self.head4   = _mla_branch(mla_ch, out_ch)
-                self.head5   = _mla_branch(mla_ch, out_ch)
-                # backward path (bottom-up): head2_1..head5_1
-                self.head2_1 = _mla_branch(mla_ch, out_ch)
-                self.head3_1 = _mla_branch(mla_ch, out_ch)
-                self.head4_1 = _mla_branch(mla_ch, out_ch)
-                self.head5_1 = _mla_branch(mla_ch, out_ch)
-
-            def forward(self, mla_feats):
-                # Official BIMLAHead.forward order: (b2,b3,b4,b5, p2,p3,p4,p5)
-                # head{2..5} takes P-features; head{2..5}_1 takes B-features.
-                mla_b2, mla_b3, mla_b4, mla_b5, \
-                    mla_p2, mla_p3, mla_p4, mla_p5 = mla_feats
-                return [
-                    self.head2(mla_p2),   self.head3(mla_p3),
-                    self.head4(mla_p4),   self.head5(mla_p5),
-                    self.head2_1(mla_b2), self.head3_1(mla_b3),
-                    self.head4_1(mla_b4), self.head5_1(mla_b5),
-                ]
-
-        class _VIT_BIMLAHead(nn.Module):
-            def __init__(self, mla_ch=256, out_ch=128):
-                super().__init__()
-                self.mlahead = _MLAHead(mla_ch, out_ch)
-                # Fusion convs: 8 × out_ch → out_ch → 1
-                # Indices 0,1,[2],3,4,[5],6,7,[8],9,10
-                # (ReLU at 2,5,8 have no params)
-                self.global_features = nn.Sequential(
-                    nn.Conv2d(out_ch * 8, out_ch, 3, padding=1, bias=True),
-                    nn.BatchNorm2d(out_ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True),
-                    nn.BatchNorm2d(out_ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True),
-                    nn.BatchNorm2d(out_ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(out_ch, out_ch, 1, bias=True),
-                    nn.BatchNorm2d(out_ch),
-                )
-                self.edge    = nn.Conv2d(out_ch,     1, 1)
-                # Training-only auxiliary head (conv_seg takes 4 forward heads × out_ch)
-                self.conv_seg = nn.Conv2d(out_ch * 4, 1, 1)
-
-            def forward(self, mla_feats, return_features=False):
-                heads = self.mlahead(mla_feats)      # 8 × [B, 128, H, W]
-                fused = torch.cat(heads, dim=1)      # [B, 1024, H, W]
-                gf    = self.global_features(fused)  # [B, 128, H, W]
-                gf    = F.relu(gf, inplace=True)
-                edge  = torch.sigmoid(self.edge(gf)) # [B, 1, H, W]
-                if return_features:
-                    return edge, gf
-                return edge
-
-        # ── Top-level Stage I model ───────────────────────────────────────
-
-        class _EDTER_Stage1(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.backbone    = _VIT_BIMLA()
-                self.decode_head = _VIT_BIMLAHead()
-
-            def forward(self, x):
-                return self.decode_head(self.backbone(x))
-
-        _edter_stage1_cls = _EDTER_Stage1
-
-    return _edter_stage1_cls()
+    from model.basemodel import Basemodel
+    _nbed_cls = Basemodel
+    _nbed_runtime_pkg = _nbed_utils
+    return _nbed_cls
 
 
-def _build_edter_stage2():
-    """Instantiate _EDTER_Stage2 — full two-stage EDTER (Pu et al., CVPR 2022).
-
-    Architecture:
-      global_model : frozen ViT-Large/16 BiMLA Stage I (built via _build_edter_stage1)
-      backbone     : ViT-Base/8 local backbone (12 layers, embed 768)
-      decode_head  : local BiMLA head with ×8 upsample to 160×160 per-quadrant
-      fuse_head    : SFT-modulated FFM that combines global + local 128-ch
-                     feature maps and produces the final 320×320 edge map
-
-    Per-tile inference flow (called once per existing 320×320 sliding-window tile):
-      tile_320 → global features (320-res, 128-ch)
-      tile_320 → 4 non-overlapping 160×160 quadrants
-                 → each quadrant → local features (160-res, 128-ch)
-                 → re-tiled to 320-res
-      FFM(local_320, global_320) → fused edge probability (320-res, 1-ch)
-
-    Module key names match the EDTER-BSDS-VOC-StageII.pth checkpoint exactly:
-      global_model.* (532 keys, frozen Stage I)
-      backbone.*     (228 keys, local ViT-Base/8)
-      decode_head.*  (128 keys, local BiMLA head)
-      fuse_head.*    (24 keys,  SFT + edge_head)
-      auxiliary_head.* and decode_head.conv_seg / fuse_head.conv_seg are
-      training-only and silently absorbed by load_state_dict(strict=False).
+class NBEDRunner:
     """
-    global _edter_stage2_cls
-    if _edter_stage2_cls is None:
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
+    NBED (Ze et al., 2024) — pure PyTorch, no mmcv, no tiling.
 
-        # Build (and cache) the Stage I class so we can use it as the
-        # frozen global_model module of Stage II.
-        _stage1_cls = _build_edter_stage1().__class__
+    Single forward pass per frame on the full image.  Input is normalised to
+    [-1, 1] (NBED's own preprocessing).  Output is a sigmoid-activated edge
+    probability map at the input resolution.
 
-        # ── ViT primitives (re-defined locally; small, self-contained) ────
+    Default architecture: DUL-M36 encoder, UNet++ decoder, default conv head.
+    BIPED checkpoint is the laser-friendly choice (cleaner long contours).
 
-        class _Attn(nn.Module):
-            def __init__(self, dim, num_heads):
-                super().__init__()
-                self.num_heads = num_heads
-                self.head_dim  = dim // num_heads
-                self.scale     = self.head_dim ** -0.5
-                self.qkv  = nn.Linear(dim, dim * 3)
-                self.proj = nn.Linear(dim, dim)
-
-            def forward(self, x):
-                B, N, C = x.shape
-                qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
-                                           self.head_dim).permute(2, 0, 3, 1, 4)
-                q, k, v = qkv.unbind(0)
-                attn = (q @ k.transpose(-2, -1)) * self.scale
-                attn = attn.softmax(dim=-1)
-                x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-                return self.proj(x)
-
-        class _Mlp(nn.Module):
-            def __init__(self, dim, ratio=4.):
-                super().__init__()
-                hid = int(dim * ratio)
-                self.fc1 = nn.Linear(dim, hid)
-                self.fc2 = nn.Linear(hid, dim)
-
-            def forward(self, x):
-                return self.fc2(F.gelu(self.fc1(x)))
-
-        class _Block(nn.Module):
-            def __init__(self, dim, num_heads):
-                super().__init__()
-                self.norm1 = nn.LayerNorm(dim)
-                self.attn  = _Attn(dim, num_heads)
-                self.norm2 = nn.LayerNorm(dim)
-                self.mlp   = _Mlp(dim)
-
-            def forward(self, x):
-                x = x + self.attn(self.norm1(x))
-                x = x + self.mlp(self.norm2(x))
-                return x
-
-        class _PatchEmbed(nn.Module):
-            def __init__(self, patch_size=8, in_ch=3, embed_dim=768):
-                super().__init__()
-                self.proj = nn.Conv2d(in_ch, embed_dim,
-                                      kernel_size=patch_size, stride=patch_size)
-
-            def forward(self, x):
-                return self.proj(x).flatten(2).transpose(1, 2)  # [B, N, E]
-
-        # ── Local MLA — 1×1 convs throughout (Stage I uses 3×3) ───────────
-        # Checkpoint shapes: mla_p{2..5}_1x1 = (256, 768, 1, 1)
-        #                    mla_p{2..5}     = (256, 256, 1, 1)
-        #                    mla_b{2..5}     = (256, 256, 1, 1)
-
-        class _MLA_LOCAL(nn.Module):
-            def __init__(self, in_ch=768, mla_ch=256):
-                super().__init__()
-                # Conv → BN → ReLU, matching the official Conv_BIMLA_LOCAL
-                # in mmseg/models/backbones/vit_bimla_local8x8.py.  See
-                # _MLA._seq*() above for the rationale; same bug, same fix.
-                def _seq1x1(ic, oc):
-                    return nn.Sequential(
-                        nn.Conv2d(ic, oc, 1, bias=False),
-                        nn.BatchNorm2d(oc),
-                        nn.ReLU(inplace=True),
-                    )
-                # 1×1 projections (768 → 256)
-                self.mla_p2_1x1 = _seq1x1(in_ch, mla_ch)
-                self.mla_p3_1x1 = _seq1x1(in_ch, mla_ch)
-                self.mla_p4_1x1 = _seq1x1(in_ch, mla_ch)
-                self.mla_p5_1x1 = _seq1x1(in_ch, mla_ch)
-                # Forward (top-down) path (256 → 256, 1×1)
-                self.mla_p2 = _seq1x1(mla_ch, mla_ch)
-                self.mla_p3 = _seq1x1(mla_ch, mla_ch)
-                self.mla_p4 = _seq1x1(mla_ch, mla_ch)
-                self.mla_p5 = _seq1x1(mla_ch, mla_ch)
-                # Backward (bottom-up) path
-                self.mla_b2 = _seq1x1(mla_ch, mla_ch)
-                self.mla_b3 = _seq1x1(mla_ch, mla_ch)
-                self.mla_b4 = _seq1x1(mla_ch, mla_ch)
-                self.mla_b5 = _seq1x1(mla_ch, mla_ch)
-
-            def forward(self, feats):
-                # See _MLA.forward (Stage I) for full rationale.  Same
-                # skip-add-of-1×1 topology; only the conv kernel size differs
-                # (Stage I uses 3×3 in mla_p{2..5}/mla_b{2..5}; Stage II local
-                # uses 1×1 throughout).
-                e2 = self.mla_p2_1x1(feats[0])
-                e3 = self.mla_p3_1x1(feats[1])
-                e4 = self.mla_p4_1x1(feats[2])
-                e5 = self.mla_p5_1x1(feats[3])
-
-                p4_plus = e5 + e4
-                p3_plus = p4_plus + e3
-                p2_plus = p3_plus + e2
-
-                mla_p5 = self.mla_p5(e5)
-                mla_p4 = self.mla_p4(p4_plus)
-                mla_p3 = self.mla_p3(p3_plus)
-                mla_p2 = self.mla_p2(p2_plus)
-
-                b3_plus = e2 + e3
-                b4_plus = b3_plus + e4
-                b5_plus = b4_plus + e5
-
-                mla_b2 = self.mla_b2(e2)
-                mla_b3 = self.mla_b3(b3_plus)
-                mla_b4 = self.mla_b4(b4_plus)
-                mla_b5 = self.mla_b5(b5_plus)
-
-                return [mla_b2, mla_b3, mla_b4, mla_b5,
-                        mla_p2, mla_p3, mla_p4, mla_p5]
-
-        # ── Local ViT-Base/8 backbone ─────────────────────────────────────
-        # Checkpoint shapes: cls_token (1,1,768), pos_embed (1,401,768),
-        # patch_embed.proj.weight (768,3,8,8), 12 transformer blocks.
-
-        class _VIT_BIMLA_LOCAL(nn.Module):
-            MLA_IDX = (2, 5, 8, 11)   # taps at quarters of a 12-layer stack
-
-            def __init__(self, img_size=160, patch_size=8, embed_dim=768,
-                         num_heads=16, depth=12, mla_ch=256):
-                super().__init__()
-                self.patch_size = patch_size
-                n_patches = (img_size // patch_size) ** 2
-                self.patch_embed = _PatchEmbed(patch_size, 3, embed_dim)
-                self.cls_token   = nn.Parameter(torch.zeros(1, 1, embed_dim))
-                self.pos_embed   = nn.Parameter(
-                    torch.zeros(1, n_patches + 1, embed_dim))
-                self.blocks = nn.ModuleList(
-                    [_Block(embed_dim, num_heads) for _ in range(depth)])
-                for i in range(4):
-                    setattr(self, f'norm_{i}', nn.LayerNorm(embed_dim))
-                self.mla = _MLA_LOCAL(embed_dim, mla_ch)
-
-            def forward(self, x):
-                B, _, H, W = x.shape
-                x = self.patch_embed(x)
-                cls = self.cls_token.expand(B, -1, -1)
-                x   = torch.cat([cls, x], dim=1)
-                x   = x + self.pos_embed
-
-                feats = []
-                ni = 0
-                for i, blk in enumerate(self.blocks):
-                    x = blk(x)
-                    if i in self.MLA_IDX:
-                        norm = getattr(self, f'norm_{ni}')
-                        feats.append(norm(x))
-                        ni += 1
-
-                ph, pw = H // self.patch_size, W // self.patch_size
-                spatial = []
-                for f in feats:
-                    s = f[:, 1:, :].permute(0, 2, 1).reshape(B, -1, ph, pw)
-                    spatial.append(s)
-                return self.mla(spatial)
-
-        # ── Local BiMLA head ──────────────────────────────────────────────
-        # Per branch: ConvTranspose2d(256→128, k=4, s=2) +BN +ReLU +
-        #             ConvTranspose2d(128→128, k=8, s=4) +BN
-        # Total ×8 upsample: 20×20 → 40×40 → 160×160.
-        # local_features: 4-step Conv chain 1024→128 (3×3), 128→128 (3×3),
-        #                 128→128 (3×3), 128→128 (1×1), each followed by BN
-        #                 + ReLU between (final BN, no trailing ReLU inside
-        #                 the Sequential — ReLU is applied externally).
-
-        def _mla_branch_local(in_ch=256, out_ch=128):
-            return nn.Sequential(
-                nn.ConvTranspose2d(in_ch,  out_ch, 4, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.ConvTranspose2d(out_ch, out_ch, 8, stride=4, padding=2, bias=False),
-                nn.BatchNorm2d(out_ch),
-            )
-
-        class _MLAHead_LOCAL(nn.Module):
-            def __init__(self, mla_ch=256, out_ch=128):
-                super().__init__()
-                self.head2   = _mla_branch_local(mla_ch, out_ch)
-                self.head3   = _mla_branch_local(mla_ch, out_ch)
-                self.head4   = _mla_branch_local(mla_ch, out_ch)
-                self.head5   = _mla_branch_local(mla_ch, out_ch)
-                self.head2_1 = _mla_branch_local(mla_ch, out_ch)
-                self.head3_1 = _mla_branch_local(mla_ch, out_ch)
-                self.head4_1 = _mla_branch_local(mla_ch, out_ch)
-                self.head5_1 = _mla_branch_local(mla_ch, out_ch)
-
-            def forward(self, mla_feats):
-                # See _MLAHead.forward (Stage I) — same destructure & mapping.
-                mla_b2, mla_b3, mla_b4, mla_b5, \
-                    mla_p2, mla_p3, mla_p4, mla_p5 = mla_feats
-                return [
-                    self.head2(mla_p2),   self.head3(mla_p3),
-                    self.head4(mla_p4),   self.head5(mla_p5),
-                    self.head2_1(mla_b2), self.head3_1(mla_b3),
-                    self.head4_1(mla_b4), self.head5_1(mla_b5),
-                ]
-
-        class _VIT_BIMLAHead_LOCAL(nn.Module):
-            def __init__(self, mla_ch=256, out_ch=128):
-                super().__init__()
-                self.mlahead = _MLAHead_LOCAL(mla_ch, out_ch)
-                self.local_features = nn.Sequential(
-                    nn.Conv2d(out_ch * 8, out_ch, 3, padding=1, bias=True),
-                    nn.BatchNorm2d(out_ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True),
-                    nn.BatchNorm2d(out_ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True),
-                    nn.BatchNorm2d(out_ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(out_ch, out_ch, 1, bias=True),
-                    nn.BatchNorm2d(out_ch),
-                )
-                self.edge     = nn.Conv2d(out_ch, 1, 1)
-                # Training-only: declared so checkpoint load doesn't warn.
-                self.conv_seg = nn.Conv2d(out_ch * 4, 1, 1)
-
-            def forward(self, mla_feats, return_features=False):
-                heads = self.mlahead(mla_feats)        # 8 × [B, 128, 160, 160]
-                fused = torch.cat(heads, dim=1)        # [B, 1024, 160, 160]
-                lf    = F.relu(self.local_features(fused), inplace=True)
-                edge  = torch.sigmoid(self.edge(lf))   # [B, 1, 160, 160]
-                if return_features:
-                    return edge, lf
-                return edge
-
-        # ── FFM (Spatial Feature Transform fusion + edge head) ────────────
-
-        class _SFTLayer(nn.Module):
-            def __init__(self, ch=128):
-                super().__init__()
-                self.SFT_scale_conv0 = nn.Conv2d(ch, ch, 1)
-                self.SFT_scale_conv1 = nn.Conv2d(ch, ch, 1)
-                self.SFT_shift_conv0 = nn.Conv2d(ch, ch, 1)
-                self.SFT_shift_conv1 = nn.Conv2d(ch, ch, 1)
-
-            def forward(self, lf, gf):
-                # SFT (Spatial Feature Transform): global features compute
-                # per-pixel scale + shift; local features are modulated as
-                #   fused = lf * (scale + 1) + shift
-                # The +1 initializes the transform near identity.  Activation
-                # between conv0 and conv1 is leaky-relu (slope 0.1) per the
-                # original SFT-GAN formulation that EDTER's repo follows.
-                scale = self.SFT_scale_conv1(F.leaky_relu(
-                    self.SFT_scale_conv0(gf), 0.1, inplace=True))
-                shift = self.SFT_shift_conv1(F.leaky_relu(
-                    self.SFT_shift_conv0(gf), 0.1, inplace=True))
-                return lf * (scale + 1.0) + shift
-
-        class _Local8x8_FuseHead(nn.Module):
-            def __init__(self, ch=128):
-                super().__init__()
-                self.SFT_head = _SFTLayer(ch)
-                self.edge_head = nn.Sequential(
-                    # Convs followed by BN have bias=False (BN absorbs the bias).
-                    nn.Conv2d(ch, ch, 3, padding=1, bias=False),
-                    nn.BatchNorm2d(ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(ch, 64, 3, padding=1, bias=False),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(64, 1, 1, bias=True),
-                )
-                # Training-only: declared so checkpoint load doesn't warn.
-                self.conv_seg = nn.Conv2d(ch, 1, 1)
-
-            def forward(self, lf, gf):
-                fused = self.SFT_head(lf, gf)
-                return torch.sigmoid(self.edge_head(fused))
-
-        # ── Top-level Stage II model ──────────────────────────────────────
-
-        class _EDTER_Stage2(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.global_model = _stage1_cls()
-                self.backbone     = _VIT_BIMLA_LOCAL()
-                self.decode_head  = _VIT_BIMLAHead_LOCAL()
-                self.fuse_head    = _Local8x8_FuseHead()
-
-            def forward(self, x):
-                # x: [B, 3, 320, 320]  (the existing 320×320 sliding-window tile)
-                B, _, H, W = x.shape
-                verbose = getattr(self, '_verbose_diag', False)
-
-                if verbose:
-                    print('  [s2] -- Stage II forward ---------------------------------', flush=True)
-                    print(f'  [s2] input:   shape={list(x.shape)}  '
-                          f'min={x.min():.3f}  max={x.max():.3f}  mean={x.mean():.3f}', flush=True)
-
-                # Global pass — full tile through frozen Stage I
-                g_feats    = self.global_model.backbone(x)
-                g_edge, gf = self.global_model.decode_head(g_feats, return_features=True)
-
-                if verbose:
-                    print(f'  [s2] g_edge   (Stage-I output):  '
-                          f'min={g_edge.min():.4f}  max={g_edge.max():.4f}  '
-                          f'mean={g_edge.mean():.4f}', flush=True)
-                    print(f'  [s2] gf       (global 128-ch):   '
-                          f'min={gf.min():.4f}  max={gf.max():.4f}  '
-                          f'mean={gf.mean():.4f}', flush=True)
-
-                # Local pass — 4 non-overlapping 160×160 quadrants
-                h_half, w_half = H // 2, W // 2
-                lf = x.new_zeros((B, 128, H, W))
-                for qy in (0, h_half):
-                    for qx in (0, w_half):
-                        q       = x[:, :, qy:qy + h_half, qx:qx + w_half]
-                        l_feats = self.backbone(q)
-                        _, lq   = self.decode_head(l_feats, return_features=True)
-                        lf[:, :, qy:qy + h_half, qx:qx + w_half] = lq
-                        if verbose:
-                            print(f'  [s2] quad     y={qy}:{qy+h_half} x={qx}:{qx+w_half}  '
-                                  f'lq: min={lq.min():.4f}  max={lq.max():.4f}  '
-                                  f'mean={lq.mean():.4f}', flush=True)
-
-                if verbose:
-                    print(f'  [s2] lf       (stitched local):  '
-                          f'min={lf.min():.4f}  max={lf.max():.4f}  '
-                          f'mean={lf.mean():.4f}', flush=True)
-
-                out = self.fuse_head(lf, gf)
-
-                if verbose:
-                    delta = (out - g_edge).abs().mean().item()
-                    print(f'  [s2] out      (Stage-II fused):  '
-                          f'min={out.min():.4f}  max={out.max():.4f}  '
-                          f'mean={out.mean():.4f}  |delta vs Stage-I|={delta:.4f}', flush=True)
-                    print('  [s2] -- end Stage II forward -----------------------------', flush=True)
-                    self._verbose_diag = False  # fire once per session
-
-                return out
-
-        _edter_stage2_cls = _EDTER_Stage2
-
-    return _edter_stage2_cls()
-
-
-class EDTERRunner:
+    Compatible with the SAM2 mask gating used elsewhere in vectorize.py: the
+    mask is ignored at inference time (NBED runs on the full frame in one
+    pass and is cheap enough not to need tile skipping) but downstream
+    consumers can still AND the output against the mask themselves.
     """
-    EDTER (Pu et al., CVPR 2022) — pure PyTorch, no mmcv.
 
-    Two operating modes (selected via the ``stage`` constructor kwarg):
+    # Strict-load sentinel set: one weight per top-level branch.
+    # If any of these drift from the checkpoint value after load, refuse to run.
+    _SENTINELS = (
+        'encoder.conv1.0.weight',          # DUL local conv1
+        'encoder.conv2.0.weight',          # DUL local conv2 (post-rename)
+        'encoder.stages.0.0.norm1.weight', # CAFormer first block, first stage
+        'decoder.convs.conv0_0.conv1.0.weight',  # UNet++ first decoder block
+        'head.final.0.weight',             # head final conv (post-rename)
+    )
 
-      stage=1  Global ViT-Large/16 + BiMLA only (Stage I).  Faster, coarser.
-               Accepts either EDTER-BSDS-VOC-StageI.pth or StageII.pth (the
-               latter's global_model.* sub-weights are extracted and the
-               local + FFM weights ignored).
-
-      stage=2  Full two-stage inference (default).  Per 320×320 sliding tile:
-                 1. Global model produces 128-ch feature map (gf, 320×320)
-                 2. Local ViT-Base/8 runs on each of 4 non-overlapping
-                    160×160 quadrants, producing per-quadrant 128-ch features
-                    that are stitched into a 320×320 local feature map (lf)
-                 3. SFT-FFM modulates lf by gf and emits the final edge
-                    probability via a 3×3 + 3×3 + 1×1 conv head + sigmoid
-               Requires an EDTER-BSDS-VOC-StageII.pth checkpoint.  If a
-               Stage I checkpoint is supplied, auto-falls-back to stage=1.
-
-    Inference: sliding window 320×320, stride 280, ImageNet normalisation.
-
-    Tile skipping: when an optional SAM2 mask is supplied to infer(), tiles
-    whose mask coverage is below TILE_SKIP_THRESHOLD are skipped entirely.
-    The corresponding region of the prediction map stays at zero (no edges),
-    so background-only tiles do not consume GPU time.
-    """
-    CROP                 = 320
-    STRIDE               = 160
-    TILE_SKIP_THRESHOLD  = 0.02
-    MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-    def __init__(self, model_path, device='cpu', stage=2, tile_blend='gaussian'):
+    def __init__(self, model_path,
+                 device='cuda',
+                 encoder='DUL-M36',
+                 decoder='UNETP',
+                 head='default'):
         import torch
-        if tile_blend not in ('gaussian', 'uniform'):
-            raise ValueError(f'tile_blend must be "gaussian" or "uniform", got {tile_blend!r}')
-        self._tile_blend = tile_blend
+        self._torch = torch
 
-        # ── Sentinel parameter keys, one per sub-branch ──────────────────
-        # If any of these are missing from the checkpoint, or if their value
-        # in the model differs from the value in the checkpoint after load,
-        # we KNOW the branch is running on random init — and we abort instead
-        # of silently producing garbage.
-        SENTINELS_STAGE2 = (
-            'global_model.backbone.blocks.0.attn.qkv.weight',
-            'global_model.decode_head.mlahead.head2.0.weight',
-            'backbone.blocks.0.attn.qkv.weight',
-            'backbone.mla.mla_p2_1x1.0.weight',
-            'decode_head.mlahead.head2.0.weight',
-            'decode_head.local_features.0.weight',
-            'fuse_head.SFT_head.SFT_scale_conv0.weight',
-            'fuse_head.edge_head.0.weight',
-        )
-        SENTINELS_STAGE1 = (
-            'backbone.blocks.0.attn.qkv.weight',
-            'backbone.mla.mla_p2_1x1.0.weight',
-            'decode_head.mlahead.head2.0.weight',
-            'decode_head.global_features.0.weight',
-        )
+        Basemodel = _build_nbed_model()
+        model = Basemodel(encoder_name=encoder,
+                          decoder_name=decoder,
+                          head_name=head)
 
-        def _build(dev, want_stage):
+        # ── Load BIPED / BSDS checkpoint via the official inference.py recipe
+        ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+        sd   = ckpt.get('state_dict', ckpt)
+
+        # Strip DataParallel prefix if present
+        if any(k.startswith('module.') for k in sd):
+            sd = {(k[len('module.'):] if k.startswith('module.') else k): v
+                  for k, v in sd.items()}
+
+        # Conditional key renames — BIPED checkpoint uses different parameter
+        # paths than our reconstructed model expects.  Per the official
+        # inference.py, encoder.conv2.1.* moved to encoder.conv2.0.*, and we
+        # additionally found decoder.final.0.* lives at head.final.0.*.
+        for old, new in (
+            ('encoder.conv2.1.weight',  'encoder.conv2.0.weight'),
+            ('encoder.conv2.1.bias',    'encoder.conv2.0.bias'),
+            ('decoder.final.0.weight',  'head.final.0.weight'),
+            ('decoder.final.0.bias',    'head.final.0.bias'),
+        ):
+            if old in sd:
+                sd[new] = sd.pop(old)
+
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing or unexpected:
             from collections import Counter
+            def _branch(k):
+                p = k.split('.', 2)
+                return '.'.join(p[:2]) if len(p) > 1 else p[0]
+            print(f'[nbed] checkpoint load: {len(missing)} missing, '
+                  f'{len(unexpected)} unexpected', flush=True)
+            if missing:
+                print(f'  missing by branch:    '
+                      f'{dict(Counter(map(_branch, missing)))}', flush=True)
+                print(f'  first 20 missing:     {missing[:20]}', flush=True)
+            if unexpected:
+                print(f'  unexpected by branch: '
+                      f'{dict(Counter(map(_branch, unexpected)))}', flush=True)
+                print(f'  first 20 unexpected:  {unexpected[:20]}', flush=True)
+            raise RuntimeError(
+                f'NBED checkpoint load incomplete: {len(missing)} missing, '
+                f'{len(unexpected)} unexpected. Refusing to run on '
+                f'partially-initialised weights — see log above.')
 
-            # ── 1. Load and normalise the checkpoint dict ───────────────
-            ckpt = torch.load(model_path, map_location='cpu',
-                              weights_only=False)
-            sd   = ckpt.get('state_dict', ckpt)
-
-            # Strip DataParallel wrapping if present.  The old code's
-            # has_stage2 detector did not strip 'module.' and would
-            # incorrectly fall back to Stage I on such checkpoints.
-            if any(k.startswith('module.') for k in sd):
-                sd = {(k[len('module.'):] if k.startswith('module.') else k): v
-                      for k, v in sd.items()}
-                print('[edter] stripped DataParallel "module." prefix '
-                      'from checkpoint', flush=True)
-
-            # Drop training-only auxiliary keys: aux heads and conv_seg.
-            # The inference model has no aux heads (training-only output
-            # branches) and declares conv_seg only as a stub so the
-            # official mmseg checkpoint loads cleanly — neither belongs
-            # in a strict per-key comparison.
-            def _is_training_only(k):
-                return (k.startswith('auxiliary_head') or
-                        '.auxiliary_head' in k or
-                        k.endswith('.conv_seg.weight') or
-                        k.endswith('.conv_seg.bias'))
-            sd = {k: v for k, v in sd.items() if not _is_training_only(k)}
-
-            has_stage2 = any(k.startswith('fuse_head.') for k in sd)
-
-            # ── 2. Stage selection + Stage-I-only slicing ───────────────
-            if want_stage == 2 and not has_stage2:
-                print(f'[edter] {model_path} has no fuse_head.* keys -- '
-                      f'falling back to Stage I', flush=True)
-                want_stage = 1
-
-            if want_stage == 2:
-                model = _build_edter_stage2()
-            else:
-                model = _build_edter_stage1()
-                if has_stage2:                       # Stage II ckpt, stage=1
-                    sd = {k[len('global_model.'):]: v
-                          for k, v in sd.items()
-                          if k.startswith('global_model.')}
-
-            # ── 3. Load + full per-branch census (no ALLOW filter) ──────
-            missing, unexpected = model.load_state_dict(sd, strict=False)
-
-            def _branch_of(k):
-                # 'a.b.c.d' → 'a.b' so the census groups by top-two-level
-                # prefix (e.g. 'global_model.backbone', 'fuse_head.SFT_head').
-                parts = k.split('.', 2)
-                return ('.'.join(parts[:2])
-                        if len(parts) > 1 else parts[0])
-
-            if missing or unexpected:
-                print(f'[edter] checkpoint load: '
-                      f'{len(missing)} missing, '
-                      f'{len(unexpected)} unexpected', flush=True)
-                if missing:
-                    print(f'  missing by branch:    '
-                          f'{dict(Counter(map(_branch_of, missing)))}',
-                          flush=True)
-                    print(f'  first 20 missing:     '
-                          f'{missing[:20]}', flush=True)
-                if unexpected:
-                    print(f'  unexpected by branch: '
-                          f'{dict(Counter(map(_branch_of, unexpected)))}',
-                          flush=True)
-                    print(f'  first 20 unexpected:  '
-                          f'{unexpected[:20]}', flush=True)
-
-            # Refuse to continue with any non-stub missing/unexpected
-            # keys. Stubs: conv_seg parameters that the model declares
-            # but the inference checkpoint never carries.
-            def _stub_missing_ok(k):
-                return (k.endswith('.conv_seg.weight') or
-                        k.endswith('.conv_seg.bias'))
-
-            hard_missing  = [k for k in missing if not _stub_missing_ok(k)]
-            hard_unexpect = list(unexpected)
-            if hard_missing or hard_unexpect:
+        # Sentinel parameter check — proves the load actually populated each
+        # branch.  Catches the "load reported clean but values stayed random"
+        # failure mode that bit us with EDTER.
+        named = dict(model.named_parameters())
+        for key in self._SENTINELS:
+            if key not in named:
                 raise RuntimeError(
-                    f'EDTER checkpoint load incomplete: '
-                    f'{len(hard_missing)} non-stub missing, '
-                    f'{len(hard_unexpect)} unexpected. '
-                    f'Refusing to run on partially-initialised weights '
-                    f'— see log above.')
+                    f'[nbed] sentinel key {key!r} not present in model — '
+                    f'NBED source layout drifted; update _SENTINELS.')
+            if key not in sd:
+                raise RuntimeError(
+                    f'[nbed] sentinel key {key!r} not in checkpoint — '
+                    f'wrong checkpoint variant? Expected BIPED/BSDS DUL-M36.')
+            diff = (named[key].detach().cpu()
+                    - sd[key].detach().cpu()).abs().max().item()
+            print(f'  [nbed] sentinel {key}: max|model-ckpt| = {diff:.2e}',
+                  flush=True)
+            if diff > 1e-6:
+                raise RuntimeError(
+                    f'[nbed] sentinel mismatch on {key}: max diff {diff} '
+                    f'— load silently failed.')
 
-            # ── 4. Sentinel parameter check ─────────────────────────────
-            # Catches "load reported clean but values stayed random".
-            sentinels = (SENTINELS_STAGE2 if want_stage == 2
-                         else SENTINELS_STAGE1)
-            named = dict(model.named_parameters())
-            for key in sentinels:
-                if key not in named:
-                    raise RuntimeError(
-                        f'[edter] sentinel key {key!r} not present in '
-                        f'model — reimpl structure drifted from official; '
-                        f'fix model class.')
-                if key not in sd:
-                    raise RuntimeError(
-                        f'[edter] sentinel key {key!r} not in checkpoint '
-                        f'— this checkpoint does not contain the '
-                        f'expected branch.')
-                diff = (named[key].detach().cpu()
-                        - sd[key].detach().cpu()).abs().max().item()
-                print(f'  [edter] sentinel {key}: '
-                      f'max|model-ckpt| = {diff:.2e}', flush=True)
-                if diff > 1e-6:
-                    raise RuntimeError(
-                        f'[edter] sentinel mismatch on {key}: max diff '
-                        f'{diff:.6f} — load silently failed.')
+        print(f'[nbed] checkpoint verified, '
+              f'{len(sd)} keys loaded, all {len(self._SENTINELS)} '
+              f'sentinels match', flush=True)
 
-            print(f'[edter] checkpoint verified, stage={want_stage}: '
-                  f'{len(sd)} keys loaded, '
-                  f'all {len(sentinels)} sentinels match', flush=True)
-
-            model.eval()
-            model.to(torch.device(dev))
-            # All BatchNorm layers stay in eval mode.  The official EDTER
-            # test scripts (tools/test.py, tools/test_local.py) rely on the
-            # checkpoint's running stats unchanged; forcing decode_head /
-            # global_model.decode_head / fuse_head BN into train() mode on a
-            # single 320×320 crop with very low spatial variance (e.g. a
-            # sparse wireframe) caused 1/sqrt(σ²+ε) to amplify ε-level noise
-            # uniformly across each tensor — producing the four near-equal
-            # per-quadrant means, the 0.0229 |Δ vs Stage-I|, and the visible
-            # 16×16 checkerboard at the Stage-I patch boundaries.
-            return model, torch.device(dev), want_stage
-
+        # ── Place on device.  Fall back to CPU on CUDA failure (matches the
+        #    pattern used by HEDRunner / DiffusionEdgeRunner above).
         def _is_cuda_err(e):
             s = str(e).lower()
-            return '127' in str(e) or 'cuda' in s or 'cudnn' in s
+            return 'cuda' in s or 'cudnn' in s or '127' in str(e)
 
         try:
-            self._model, self._device, self._stage = _build(device, stage)
+            model.eval().to(torch.device(device))
+            self._device = torch.device(device)
         except Exception as e:
             if device != 'cpu' and _is_cuda_err(e):
-                print(f'[edter] CUDA failed ({e}), retrying on CPU', flush=True)
-                self._model, self._device, self._stage = _build('cpu', stage)
+                print(f'[nbed] CUDA failed ({e}), retrying on CPU', flush=True)
+                model.eval().to(torch.device('cpu'))
+                self._device = torch.device('cpu')
             else:
                 raise
 
-        self._torch = torch
-
-        # Pre-compute the per-tile Gaussian weight on the model device.
-        # Sigma = CROP / 4 ≈ 80 px gives center weight 1.0, edge-of-tile weight
-        # ~0.135 — strong enough at the 40-px stride overlap to blend smoothly,
-        # weak enough at the boundary that center-of-tile predictions dominate.
-        # This removes the visible 8×8 patch-grid artifact at tile seams.
-        ax = torch.arange(self.CROP, dtype=torch.float32) - (self.CROP - 1) / 2.0
-        gx = torch.exp(-0.5 * (ax / (self.CROP / 4.0)) ** 2)
-        self._tile_weight = (gx[:, None] * gx[None, :]).view(1, 1, self.CROP, self.CROP)
-        self._tile_weight = self._tile_weight.to(self._device)
-
-        print(f'[edter] Loaded {model_path}  device={self._device}  '
-              f'stage={self._stage}  tile_blend={self._tile_blend}', flush=True)
+        self._model = model
+        print(f'[nbed] Loaded {model_path}  device={self._device}  '
+              f'encoder={encoder}/{decoder}/{head}', flush=True)
 
     def infer(self, bgr_frame, mask=None):
-        import torch.nn.functional as F
+        """Run NBED on a single BGR uint8 frame, return float32 [H,W] in [0,1].
+
+        `mask` parameter accepted for interface compatibility with other
+        runners (HED/DiffusionEdge gate by it); NBED is fast enough to not
+        need tile skipping and ignores it."""
         import time as _time
-        torch  = self._torch
-        h0, w0 = bgr_frame.shape[:2]
-
-        if not getattr(self, '_infer_diag_done', False):
-            param_dev = next(self._model.parameters()).device
-            print(f'[edter] infer diag: self._device={self._device}  '
-                  f'model param device={param_dev}', flush=True)
-            self._infer_diag_done = True
         _t0 = _time.perf_counter()
+        torch = self._torch
 
-        # BGR → RGB, normalise to ImageNet
+        h0, w0 = bgr_frame.shape[:2]
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        rgb = (rgb - self.MEAN) / self.STD        # mean/std are broadcast over HxWx3
+        x   = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
+        x   = x * 2.0 - 1.0                                 # [-1, 1]
+        x   = x.to(self._device, non_blocking=True)
 
-        # Pad if smaller than one crop
-        ph = max(0, self.CROP - h0)
-        pw = max(0, self.CROP - w0)
-        if ph or pw:
-            rgb = np.pad(rgb, ((0, ph), (0, pw), (0, 0)), mode='reflect')
-        H, W = rgb.shape[:2]
+        with torch.no_grad():
+            edge = self._model(x)
 
-        inp = torch.from_numpy(
-            rgb.transpose(2, 0, 1)).unsqueeze(0).to(self._device)   # [1, 3, H, W]
+        # Most NBED configs (incl. DUL-M36 + UNETP) emit at input resolution,
+        # but interpolate defensively in case a future encoder downsamples.
+        if edge.shape[-2:] != (h0, w0):
+            edge = torch.nn.functional.interpolate(
+                edge, size=(h0, w0), mode='bilinear', align_corners=False)
 
-        h_grids = max(H - self.CROP + self.STRIDE - 1, 0) // self.STRIDE + 1
-        w_grids = max(W - self.CROP + self.STRIDE - 1, 0) // self.STRIDE + 1
-        preds   = inp.new_zeros((1, 1, H, W))
-        cnt_mat = inp.new_zeros((1, 1, H, W))
+        edge_np = edge.squeeze().detach().cpu().numpy().astype(np.float32)
+        edge_np = np.clip(edge_np, 0.0, 1.0)
 
-        skipped = 0
-        total   = h_grids * w_grids
-        print(f'[edter] stage={self._stage}  grid={h_grids}x{w_grids} ({total} tiles)  '
-              f'frame={w0}x{h0}  padded={W}x{H}  '
-              f'tile_blend={self._tile_blend}', flush=True)
-
-        for hi in range(h_grids):
-            for wi in range(w_grids):
-                y1 = hi * self.STRIDE;        x1 = wi * self.STRIDE
-                y2 = min(y1 + self.CROP, H);  x2 = min(x1 + self.CROP, W)
-                y1 = max(y2 - self.CROP, 0);  x1 = max(x2 - self.CROP, 0)
-                tile_idx = hi * w_grids + wi
-
-                # Skip tiles with negligible mask coverage. Both axes are
-                # clamped to (h0, w0) so reflect-padded regions never count
-                # as foreground.
-                if mask is not None:
-                    my2 = min(y2, h0); mx2 = min(x2, w0)
-                    if my2 <= y1 or mx2 <= x1 \
-                       or mask[y1:my2, x1:mx2].mean() < self.TILE_SKIP_THRESHOLD:
-                        skipped += 1
-                        print(f'[edter]   tile {tile_idx+1:>2}/{total}  '
-                              f'y={y1}:{y2}  x={x1}:{x2}  → SKIPPED (mask coverage)', flush=True)
-                        continue
-
-                # Arm Stage II verbose diagnostics on the first processed tile
-                if self._stage == 2 and not getattr(self, '_s2_verbose_fired', False):
-                    self._model._verbose_diag = True
-                    self._s2_verbose_fired = True
-
-                crop = inp[:, :, y1:y2, x1:x2]          # always [1, 3, 320, 320]
-                print(f'[edter]   tile {tile_idx+1:>2}/{total}  '
-                      f'y={y1}:{y2}  x={x1}:{x2}  '
-                      f'inp:[{crop.min():.3f},{crop.max():.3f}]', flush=True)
-                _tc = _time.perf_counter()
-                with torch.no_grad():
-                    out = self._model(crop)              # [1, 1, 320, 320]
-                tile_ms = (_time.perf_counter() - _tc) * 1000
-                print(f'[edter]   tile {tile_idx+1:>2}/{total}  '
-                      f'out:[{out.min():.4f},{out.max():.4f}]  '
-                      f'mean={out.mean():.4f}  {tile_ms:.0f} ms', flush=True)
-
-                if self._tile_blend == 'gaussian':
-                    w = self._tile_weight
-                    preds  [:, :, y1:y2, x1:x2] += out * w
-                    cnt_mat[:, :, y1:y2, x1:x2] += w
-                else:  # 'uniform' — legacy averaging
-                    preds  [:, :, y1:y2, x1:x2] += out
-                    cnt_mat[:, :, y1:y2, x1:x2] += 1.0
-
-        print(f'[edter] tiles done: processed={total - skipped}  skipped={skipped}', flush=True)
-
-        edge = (preds / cnt_mat.clamp(min=1e-6)).squeeze().cpu().numpy()
-        edge_crop = edge[:h0, :w0]
-        above_half = float((edge_crop > 0.5).sum()) / edge_crop.size * 100.0
-        print(f'[edter] frame output: min={edge_crop.min():.4f}  max={edge_crop.max():.4f}  '
-              f'mean={edge_crop.mean():.4f}  px>0.5: {above_half:.1f}%', flush=True)
         elapsed = _time.perf_counter() - _t0
-        print(f'[edter] frame done: {elapsed*1000:.0f} ms total', flush=True)
-        return cv2.resize(edge_crop, (w0, h0), interpolation=cv2.INTER_LINEAR)
+        above_half = float((edge_np > 0.5).sum()) / edge_np.size * 100.0
+        print(f'[nbed] frame: shape={edge_np.shape}  min={edge_np.min():.4f}  '
+              f'max={edge_np.max():.4f}  mean={edge_np.mean():.4f}  '
+              f'px>0.5: {above_half:.1f}%  {elapsed*1000:.0f} ms',
+              flush=True)
+        return edge_np
 
 
 # =============================================================================
@@ -1403,3 +633,37 @@ class DiffusionEdgeRunner:
         elapsed = _time.perf_counter() - _t0
         print(f'[diffusion_edge] frame done: {elapsed*1000:.0f} ms total', flush=True)
         return cv2.resize(edge[:h0, :w0], (w0, h0), interpolation=cv2.INTER_LINEAR)
+
+
+# =============================================================================
+# Canny — classical Sobel-of-Gaussian + hysteresis edge detector.
+#
+# Wrapped as a Runner so Stage 1 can dispatch over all four edge methods
+# uniformly.  No model file; parameters baked in from defaults.py.
+# =============================================================================
+
+class CannyRunner:
+    """OpenCV Canny edge detector, presented as a uniform Runner.
+
+    Returns a float32 [H, W] edge map in [0, 1] — the binary cv2.Canny output
+    cast to the soft-map contract so Stage 2 can thin it identically to HED /
+    NBED / DiffusionEdge outputs.
+    """
+
+    def __init__(self, model_path=None, device='cpu', *,
+                 low=40, high=120, blur_k=3):
+        # model_path / device unused; accepted for interface compatibility
+        # with the loader signature in vectorize.py.
+        self.low    = int(low)
+        self.high   = int(high)
+        self.blur_k = int(blur_k)
+        print(f'[canny] Loaded  low={self.low}  high={self.high}  '
+              f'blur_k={self.blur_k}', flush=True)
+
+    def infer(self, bgr_frame, mask=None):
+        gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+        if self.blur_k > 1:
+            k = self.blur_k | 1
+            gray = cv2.GaussianBlur(gray, (k, k), 0)
+        edges = cv2.Canny(gray, self.low, self.high)
+        return edges.astype(np.float32) / 255.0

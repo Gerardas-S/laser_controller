@@ -350,23 +350,24 @@ void PrintMenu(const HeliosOutput& laser)
 
     std::cout << "\n";
     std::cout << "  connect / disconnect\n\n";
-    std::cout << "  --- SAM2 pipeline ---\n";
-    std::cout << "  process  <video>                  Full pipeline: segment + vectorize(all) + encode(all)\n";
-    std::cout << "  process  <video> <prompt>         ... with Grounding DINO text prompt  e.g. process clip.mp4 person\n";
-    std::cout << "  process  <video> --interactive    ... with click-to-place SAM2 points on frame 0\n";
-    std::cout << "\n";
-    std::cout << "  --- Individual stages ---\n";
+    std::cout << "  --- 4-stage pipeline ---\n";
     std::cout << "  segment  <video>                  Stage 1: video -> masks (blind 5-point grid)\n";
     std::cout << "  segment  <video> <prompt>         Stage 1: video -> masks via Grounding DINO text query\n";
     std::cout << "  segment  <video> --interactive    Stage 1: video -> masks via click prompting on frame 0\n";
     std::cout << "                                      L-click=subject  R-click=background  U=undo  Enter=confirm\n";
     std::cout << "  preview-masks <video>             View segmentation masks\n";
     std::cout << "\n";
-    std::cout << "  vectorize <video> <method>        Stage 2: masks -> polylines\n";
-    std::cout << "                                      method: canny | hed | edter | diffusion_edge\n";
-    std::cout << "  preview-polylines <video> <method> View vectorized paths\n";
+    std::cout << "  vectorize <video> <stage0> <edge> <thin> <vec>\n";
+    std::cout << "                                    Stage 2: masks -> polylines (4-stage pipeline)\n";
+    std::cout << "                                      stage0: none | cb         (cb = CLAHE + bilateral)\n";
+    std::cout << "                                      edge:   canny | hed | nbed | de    (de = DiffusionEdge)\n";
+    std::cout << "                                      thin:   none | nms | zs | steger   (zs = Zhang-Suen)\n";
+    std::cout << "                                      vec:    dp | ge | iarussi          (ge = greedy Eulerian)\n";
+    std::cout << "  preview-polylines <video> <stage0> <edge> <thin> <vec>  View vectorized paths\n";
     std::cout << "\n";
-    std::cout << "  encode   <video> <method>         Stage 3: polylines -> ILDA + play\n\n";
+    std::cout << "  encode   <video> <stage0> <edge> <thin> <vec>          Stage 3: polylines -> ILDA + play\n";
+    std::cout << "\n";
+    std::cout << "  (Batch matrix sweeps: run `python scripts/experiment_runner.py` outside the C++ app.)\n\n";
 
     std::cout << "  --- Parameters (set <param> <val>) ---\n";
     std::cout << "    Animation playback (effective immediately on loaded .ild files):\n";
@@ -512,7 +513,7 @@ int main()
         // ── SAM2 pipeline helpers ─────────────────────────────────────────────
         // Shared path computation: given a video path, derive all stage paths.
         // model tag is hardcoded here — change kSam2Model to upgrade.
-        static const std::string kSam2Model  = "tiny";
+        static const std::string kSam2Model  = "large";
         static const std::string kSam2Device = "cuda";
 
         // Resolve a video argument: if the file exists as-is use it, otherwise
@@ -529,11 +530,10 @@ int main()
             -> std::tuple<fs::path, fs::path, fs::path>
         {
             // returns {masksPath, polylinesPath, animPath}
-            std::string stem    = fs::path(videoPath).stem().string();
-            std::string maskTag = stem + "_sam2-" + kSam2Model;
-            fs::path masksPath  = kResourcesDir / "masks"     / (maskTag + ".npz");
-            fs::path polyPath   = kResourcesDir / "polylines" / (maskTag + "_" + method + ".json");
-            fs::path animPath   = kResourcesDir / "animations"/ (maskTag + "_" + method + ".ild");
+            std::string stem   = fs::path(videoPath).stem().string();
+            fs::path masksPath = kResourcesDir / "masks"      / (stem + ".npz");
+            fs::path polyPath  = kResourcesDir / "polylines"  / (stem + "_" + method + ".json");
+            fs::path animPath  = kResourcesDir / "animations" / (stem + "_" + method + ".ild");
             return {masksPath, polyPath, animPath};
         };
 
@@ -549,142 +549,46 @@ int main()
             _pclose(pipe);
         };
 
-        // ── process <video> [prompt] — full pipeline: segment → vectorize×4 → encode×4
-        if (line.rfind("process ", 0) == 0) {
-            std::istringstream ss(line.substr(8));
-            std::string videoPath, prompt;
-            ss >> videoPath;
-            videoPath = ResolveVideo(videoPath);
-            std::getline(ss, prompt);
-            if (!prompt.empty() && prompt.front() == ' ') prompt = prompt.substr(1);
+        // ──────────────────────────────────────────────────────────────────────
+        // 4-stage pipeline helpers (shared by vectorize / preview-polylines /
+        // encode handlers).  Validate stage-method names and construct the
+        // pipeline-tagged JSON / ILD paths so distinct (stage0, edge, thin,
+        // vec) tuples never clobber each other's outputs.
+        // ──────────────────────────────────────────────────────────────────────
+        static const std::vector<std::string> kStage0Methods = {"none","cb"};
+        static const std::vector<std::string> kEdgeMethods   = {"canny","hed","nbed","de"};
+        static const std::vector<std::string> kThinMethods   = {"none","nms","zs","steger"};
+        static const std::vector<std::string> kVecMethods    = {"dp","ge","iarussi"};
 
-            if (videoPath.empty()) {
-                std::cerr << "Usage: process <video> [prompt | --interactive]\n";
-                PrintMenu(laser); continue;
-            }
+        auto ValidStage = [](const std::vector<std::string>& valid,
+                              const std::string& v) -> bool {
+            return std::find(valid.begin(), valid.end(), v) != valid.end();
+        };
 
-            // Build all paths up-front (method doesn't affect masks/segment)
-            auto [masksPath, _p, _a] = PipelinePaths(videoPath, "hed");
-            fs::path segScript  = kProjectDir / "scripts" / "segment.py";
-            fs::path vecScript  = kProjectDir / "scripts" / "vectorize.py";
-            fs::path encScript  = kProjectDir / "scripts" / "encode.py";
-            fs::path ckptDir    = kProjectDir / "models"  / "sam2";
-            fs::path gdinoModel = kProjectDir / "models"  / "gdino" /
-                                  "groundingdino_swint_ogc.pth";
-            fs::path edterModel      = kProjectDir / "models" / "edter"          / "EDTER-BSDS-VOC-StageII.pth";
-            fs::path diffEdgeModel   = kProjectDir / "models" / "diffusion_edge" / "bsds.pt";
-            fs::path diffEdgeStage1  = kProjectDir / "models" / "diffusion_edge" / "first_stage_total_320.pt";
-            fs::path diffEdgeConfig  = kProjectDir / "models" / "diffusion_edge" / "bsds_sample.yaml";
-
-            // segment command
-            std::string segCmd =
-                kPython + " \"" + segScript.string()        + "\""
-                " --video \""         + videoPath            + "\""
-                " --output \""        + masksPath.string()   + "\""
-                " --model "           + kSam2Model           +
-                " --checkpoint-dir \"" + ckptDir.string()    + "\""
-                " --device "          + kSam2Device          +
-                " --gdino-model \""   + gdinoModel.string()  + "\"";
-            if (prompt == "--interactive")
-                segCmd += " --interactive";
-            else if (!prompt.empty())
-                segCmd += " --prompt \"" + prompt + "\"";
-
-            // vectorize --method all writes one JSON per method automatically
-            // We point --output at the base polylines path (method tag inserted by script)
-            auto [_m, polyBase, _b] = PipelinePaths(videoPath, "all");
-            // polyBase ends in "_all.json"; the script strips that and uses stem
-            // Actually vectorize.py inserts the method suffix itself, so pass the base name
+        // Build per-pipeline JSON / ILD paths from the four stage tags.
+        // Mask path includes the SAM2 model tag (different models → different masks).
+        // Polyline / animation paths are keyed only by video stem + pipeline stages —
+        // the viewer doesn't care which SAM2 model produced the mask.
+        // Example: ballet_cb_hed_steger_ge.{json|ild}
+        auto BuildPipelinePaths = [&](const std::string& videoPath,
+                                       const std::string& stage0,
+                                       const std::string& edge,
+                                       const std::string& thin,
+                                       const std::string& vec)
+            -> std::tuple<fs::path, fs::path, fs::path> {
             std::string stem    = fs::path(videoPath).stem().string();
-            std::string maskTag = stem + "_sam2-" + kSam2Model;
-            fs::path polyDir    = kResourcesDir / "polylines";
-            fs::path animDir    = kResourcesDir / "animations";
-            fs::path polyAllOut = polyDir / (maskTag + ".json"); // script adds _method
+            std::string pipeTag = stage0 + "_" + edge + "_" + thin + "_" + vec;
+            fs::path masksPath = kResourcesDir / "masks"      / (stem + ".npz");
+            fs::path polyPath  = kResourcesDir / "polylines"  / (stem + "_" + pipeTag + ".json");
+            fs::path animPath  = kResourcesDir / "animations" / (stem + "_" + pipeTag + ".ild");
+            return {masksPath, polyPath, animPath};
+        };
 
-            std::string vecCmd =
-                kPython + " \"" + vecScript.string()                    + "\""
-                " --video \""                    + videoPath             + "\""
-                " --masks \""                    + masksPath.string()    + "\""
-                " --output \""                   + polyAllOut.string()   + "\""
-                " --method all"
-                " --edter-model \""              + edterModel.string()   + "\""
-                " --diffusion-edge-model \""     + diffEdgeModel.string()  + "\""
-                " --diffusion-edge-first-stage-model \"" + diffEdgeStage1.string() + "\""
-                " --diffusion-edge-config \""    + diffEdgeConfig.string() + "\""
-                " --device "                     + kSam2Device;
-
-            // encode commands — one per method
-            static const std::vector<std::string> kAllMethods = {"canny","hed","edter","diffusion_edge"};
-            std::vector<std::string> encCmds;
-            std::vector<fs::path>    animPaths;
-            for (const auto& m : kAllMethods) {
-                fs::path polyPath = polyDir  / (maskTag + "_" + m + ".json");
-                fs::path animPath = animDir  / (maskTag + "_" + m + ".ild");
-                encCmds.push_back(
-                    kPython + " \"" + encScript.string()  + "\""
-                    " --polylines \"" + polyPath.string() + "\""
-                    " --output \""    + animPath.string() + "\"");
-                animPaths.push_back(animPath);
-            }
-
-            if (g_videoThread.joinable()) {
-                g_videoProcessing = false;
-                g_videoReady      = false;
-                g_videoThread.join();
-            }
-            g_videoProcessing = true;
-            g_videoThread = std::thread([=, &laser]() mutable {
-
-                auto RunStage = [](const std::string& label, const std::string& cmd) -> bool {
-                    std::cout << "\n" << label << "\n" << std::flush;
-                    FILE* pipe = _popen(("\"" + cmd + " 2>&1\"").c_str(), "r");
-                    if (!pipe) { std::cerr << label << " failed to launch\n"; return false; }
-                    char buf[512];
-                    while (fgets(buf, sizeof(buf), pipe))
-                        std::cout << buf << std::flush;
-                    int ret = _pclose(pipe);
-                    if (ret != 0) std::cerr << label << " exited with code " << ret << "\n";
-                    return ret == 0;
-                };
-
-                fs::create_directories(masksPath.parent_path());
-                fs::create_directories(polyDir);
-                fs::create_directories(animDir);
-
-                // Stage 1 — segment (skip if masks already exist)
-                if (fs::exists(masksPath)) {
-                    std::cout << "\n[process] Masks cached — skipping segment.\n" << std::flush;
-                } else {
-                    if (!RunStage("[process:segment]", segCmd)) {
-                        std::cerr << "[process] Aborting pipeline.\n> " << std::flush;
-                        g_videoProcessing = false;
-                        return;
-                    }
-                }
-
-                // Stage 2 — vectorize all methods
-                if (!RunStage("[process:vectorize]", vecCmd)) {
-                    std::cerr << "[process] Vectorize failed — aborting.\n> " << std::flush;
-                    g_videoProcessing = false;
-                    return;
-                }
-
-                // Stage 3 — encode each method
-                for (std::size_t i = 0; i < encCmds.size(); ++i) {
-                    RunStage("[process:encode:" + kAllMethods[i] + "]", encCmds[i]);
-                }
-
-                std::cout << "\n[process] Done. ILDA files written to resources/animations/\n"
-                          << "> " << std::flush;
-                g_videoProcessing = false;
-            });
-
-            std::cout << "Processing: " << videoPath << "\n"
-                      << "Runs segment → vectorize(all) → encode(all). This may take a while.\n"
-                      << "Console remains live. Type 'stop' to abort.\n";
-            PrintMenu(laser);
-            continue;
-        }
+        // `process` command was removed in the 4-stage pipeline refactor.
+        // Single-pipeline runs go through `segment` + `vectorize` + `encode`
+        // explicitly; batch matrix sweeps run via
+        //   python scripts/experiment_runner.py
+        // outside the C++ app.
 
         // ── segment <video> [prompt] ──────────────────────────────────────────
         if (line.rfind("segment ", 0) == 0) {
@@ -696,8 +600,25 @@ int main()
             if (!prompt.empty() && prompt.front() == ' ') prompt = prompt.substr(1);
 
             if (videoPath.empty()) {
-                std::cerr << "Usage: segment <video> [prompt | --interactive]\n";
+                std::cerr << "Usage: segment <video> [--frames N,N,...] [prompt | --interactive]\n";
                 PrintMenu(laser); continue;
+            }
+
+            // Extract optional --frames N,N,... from the prompt string
+            // Value is a comma-separated list with no spaces, e.g. --frames 0,56,190
+            std::string framesArg;
+            {
+                auto pos = prompt.find("--frames ");
+                if (pos != std::string::npos) {
+                    std::istringstream fs(prompt.substr(pos + 9));
+                    fs >> framesArg;   // reads one token (no spaces in comma-separated list)
+                    auto end = prompt.find(' ', pos + 9);
+                    prompt.erase(pos, (end == std::string::npos ? prompt.size() : end) - pos);
+                    while (prompt.find("  ") != std::string::npos)
+                        prompt.replace(prompt.find("  "), 2, " ");
+                    if (!prompt.empty() && prompt.front() == ' ') prompt = prompt.substr(1);
+                    if (!prompt.empty() && prompt.back()  == ' ') prompt.pop_back();
+                }
             }
 
             auto [masksPath, polyPath, animPath] = PipelinePaths(videoPath, "canny");
@@ -716,6 +637,8 @@ int main()
                 " --checkpoint-dir \"" + ckptDir.string()  + "\""
                 " --device "          + kSam2Device        +
                 " --gdino-model \""   + gdinoModel.string()+ "\"";
+            if (!framesArg.empty())
+                cmd += " --frames " + framesArg;
             if (prompt == "--interactive")
                 cmd += " --interactive";
             else if (!prompt.empty())
@@ -775,44 +698,48 @@ int main()
             continue;
         }
 
-        // ── vectorize <video> <method> ────────────────────────────────────────
+        // ── vectorize <video> <stage0> <edge> <thin> <vec> ────────────────────
         if (line.rfind("vectorize ", 0) == 0) {
             std::istringstream ss(line.substr(10));
-            std::string videoPath, method;
-            ss >> videoPath >> method;
+            std::string videoPath, stage0, edge, thin, vec;
+            ss >> videoPath >> stage0 >> edge >> thin >> vec;
             videoPath = ResolveVideo(videoPath);
 
-            static const std::vector<std::string> kMethods = {"canny","hed","edter","diffusion_edge"};
-            if (videoPath.empty() || method.empty() ||
-                std::find(kMethods.begin(), kMethods.end(), method) == kMethods.end()) {
-                std::cerr << "Usage: vectorize <video> <canny|hed|edter|diffusion_edge>\n";
+            if (videoPath.empty() ||
+                !ValidStage(kStage0Methods, stage0) ||
+                !ValidStage(kEdgeMethods,   edge)   ||
+                !ValidStage(kThinMethods,   thin)   ||
+                !ValidStage(kVecMethods,    vec)) {
+                std::cerr << "Usage: vectorize <video> <stage0> <edge> <thin> <vec>\n"
+                          << "  stage0: none | cb         (cb = CLAHE + bilateral)\n"
+                          << "  edge:   canny | hed | nbed | de    (de = DiffusionEdge)\n"
+                          << "  thin:   none | nms | zs | steger   (zs = Zhang-Suen)\n"
+                          << "  vec:    dp | ge | iarussi          (ge = greedy Eulerian)\n";
                 PrintMenu(laser); continue;
             }
 
-            auto [masksPath, polyPath, animPath] = PipelinePaths(videoPath, method);
+            auto [masksPath, polyPath, animPath] =
+                BuildPipelinePaths(videoPath, stage0, edge, thin, vec);
             if (!fs::exists(masksPath)) {
                 std::cerr << "[vectorize] Masks not found: " << masksPath << "\n"
                              "  Run 'segment' first.\n";
                 PrintMenu(laser); continue;
             }
             fs::create_directories(polyPath.parent_path());
-            fs::path vecScript      = kProjectDir / "scripts" / "vectorize.py";
-            fs::path edterModel     = kProjectDir / "models" / "edter"          / "EDTER-BSDS-VOC-StageII.pth";
-            fs::path diffEdgeModel  = kProjectDir / "models" / "diffusion_edge" / "bsds.pt";
-            fs::path diffEdgeStage1 = kProjectDir / "models" / "diffusion_edge" / "first_stage_total_320.pt";
-            fs::path diffEdgeCfg    = kProjectDir / "models" / "diffusion_edge" / "bsds_sample.yaml";
+            fs::path vecScript = kProjectDir / "scripts" / "vectorize.py";
 
+            // 4-stage pipeline: model paths are now hard-coded in
+            // pipeline/defaults.py.  CLI only carries stage selection.
             std::string cmd =
-                kPython + " \"" + vecScript.string()                    + "\""
-                " --video \""                    + videoPath             + "\""
-                " --masks \""                    + masksPath.string()    + "\""
-                " --output \""                   + polyPath.string()     + "\""
-                " --method "                     + method                +
-                " --edter-model \""              + edterModel.string()   + "\""
-                " --diffusion-edge-model \""     + diffEdgeModel.string()  + "\""
-                " --diffusion-edge-first-stage-model \"" + diffEdgeStage1.string() + "\""
-                " --diffusion-edge-config \""    + diffEdgeCfg.string()    + "\""
-                " --device "                     + kSam2Device;
+                kPython + " \"" + vecScript.string()  + "\""
+                " --video \""   + videoPath           + "\""
+                " --masks \""   + masksPath.string()  + "\""
+                " --output \""  + polyPath.string()   + "\""
+                " --stage0 "    + stage0              +
+                " --edge "      + edge                +
+                " --thin "      + thin                +
+                " --vec "       + vec                 +
+                " --device "    + kSam2Device;
 
             if (g_videoThread.joinable()) {
                 g_videoProcessing = false;
@@ -840,22 +767,28 @@ int main()
                 }
                 g_videoProcessing = false;
             });
-            std::cout << "Vectorizing (" << method << "): " << videoPath << "\n";
+            std::cout << "Vectorizing (" << stage0 << " / " << edge << " / "
+                      << thin << " / " << vec << "): " << videoPath << "\n";
             PrintMenu(laser);
             continue;
         }
 
-        // ── preview-polylines <video> <method> ────────────────────────────────
+        // ── preview-polylines <video> <stage0> <edge> <thin> <vec> ───────────
         if (line.rfind("preview-polylines ", 0) == 0) {
             std::istringstream ss(line.substr(18));
-            std::string videoPath, method;
-            ss >> videoPath >> method;
+            std::string videoPath, stage0, edge, thin, vec;
+            ss >> videoPath >> stage0 >> edge >> thin >> vec;
             videoPath = ResolveVideo(videoPath);
-            if (videoPath.empty() || method.empty()) {
-                std::cerr << "Usage: preview-polylines <video> <method>\n";
+            if (videoPath.empty() ||
+                !ValidStage(kStage0Methods, stage0) ||
+                !ValidStage(kEdgeMethods,   edge)   ||
+                !ValidStage(kThinMethods,   thin)   ||
+                !ValidStage(kVecMethods,    vec)) {
+                std::cerr << "Usage: preview-polylines <video> <stage0> <edge> <thin> <vec>\n";
                 PrintMenu(laser); continue;
             }
-            auto [masksPath, polyPath, animPath] = PipelinePaths(videoPath, method);
+            auto [masksPath, polyPath, animPath] =
+                BuildPipelinePaths(videoPath, stage0, edge, thin, vec);
             if (!fs::exists(polyPath)) {
                 std::cerr << "[preview] Polylines not found: " << polyPath << "\n"
                              "  Run 'vectorize' first.\n";
@@ -871,21 +804,28 @@ int main()
             continue;
         }
 
-        // ── encode <video> <method> ───────────────────────────────────────────
+        // ── encode <video> <stage0> <edge> <thin> <vec> ───────────────────────
         if (line.rfind("encode ", 0) == 0) {
             std::istringstream ss(line.substr(7));
-            std::string videoPath, method;
-            ss >> videoPath >> method;
+            std::string videoPath, stage0, edge, thin, vec;
+            ss >> videoPath >> stage0 >> edge >> thin >> vec;
             videoPath = ResolveVideo(videoPath);
 
-            static const std::vector<std::string> kMethods = {"canny","hed","edter","diffusion_edge"};
-            if (videoPath.empty() || method.empty() ||
-                std::find(kMethods.begin(), kMethods.end(), method) == kMethods.end()) {
-                std::cerr << "Usage: encode <video> <canny|hed|edter|diffusion_edge>\n";
+            if (videoPath.empty() ||
+                !ValidStage(kStage0Methods, stage0) ||
+                !ValidStage(kEdgeMethods,   edge)   ||
+                !ValidStage(kThinMethods,   thin)   ||
+                !ValidStage(kVecMethods,    vec)) {
+                std::cerr << "Usage: encode <video> <stage0> <edge> <thin> <vec>\n"
+                          << "  stage0: none | cb         (cb = CLAHE + bilateral)\n"
+                          << "  edge:   canny | hed | nbed | de    (de = DiffusionEdge)\n"
+                          << "  thin:   none | nms | zs | steger   (zs = Zhang-Suen)\n"
+                          << "  vec:    dp | ge | iarussi          (ge = greedy Eulerian)\n";
                 PrintMenu(laser); continue;
             }
 
-            auto [masksPath, polyPath, animPath] = PipelinePaths(videoPath, method);
+            auto [masksPath, polyPath, animPath] =
+                BuildPipelinePaths(videoPath, stage0, edge, thin, vec);
             if (!fs::exists(polyPath)) {
                 std::cerr << "[encode] Polylines not found: " << polyPath << "\n"
                              "  Run 'vectorize' first.\n";
@@ -931,7 +871,8 @@ int main()
                 }
                 g_videoProcessing = false;
             });
-            std::cout << "Encoding (" << method << "): " << videoPath << "\n";
+            std::cout << "Encoding (" << stage0 << " / " << edge << " / "
+                      << thin << " / " << vec << "): " << videoPath << "\n";
             PrintMenu(laser);
             continue;
         }

@@ -56,7 +56,7 @@ def parse_args():
     p.add_argument('--output',          required=True,
                    help='Output .npz mask file path')
     # SAM2
-    p.add_argument('--model',           default='tiny',
+    p.add_argument('--model',           default='large',
                    choices=['tiny', 'small', 'base', 'large'],
                    help='SAM2 model size')
     p.add_argument('--checkpoint-dir',  default='models/sam2',
@@ -83,10 +83,15 @@ def parse_args():
                         'union=merge all candidates into one box (default).')
     # Interactive point selection (overrides --prompt)
     p.add_argument('--interactive',     action='store_true',
-                   help='Show frame 0 in a window and collect SAM2 point prompts '
-                        'by clicking.  Left=subject (green), right=background '
-                        '(red), U=undo, Enter=confirm, Esc=cancel.  Takes '
-                        'priority over --prompt.')
+                   help='Show the prompt frame in a window and collect SAM2 point '
+                        'prompts by clicking.  Left=subject (green), '
+                        'right=background (red), U=undo, Enter=confirm, Esc=cancel. '
+                        'Takes priority over --prompt.')
+    p.add_argument('--frames',          default='0',
+                   help='Comma-separated frame indices to prompt on in interactive mode '
+                        '(e.g. 0,56,190).  Default: 0.  Each frame opens a click window '
+                        'in order; Esc on any frame skips it.  Propagation starts from '
+                        'the earliest confirmed frame.  Ignored for GDINO/grid modes.')
     return p.parse_args()
 
 
@@ -373,7 +378,16 @@ def main():
 
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame0_bgr = None
+
+        # Parse --frames into a sorted list of unique ints
+        prompt_frames = sorted(set(
+            int(x.strip()) for x in args.frames.split(',')
+            if x.strip().lstrip('-').isdigit()
+        )) or [0]
+        prompt_frames_set = set(prompt_frames)
+
+        frame0_bgr       = None   # always frame 0 (GDINO / grid fallback)
+        prompt_frame_bgrs = {}    # {frame_idx: bgr} — for interactive mode
         fi = 0
         while True:
             ret, frm = cap.read()
@@ -381,10 +395,14 @@ def main():
                 break
             if fi == 0:
                 frame0_bgr = frm.copy()
+            if fi in prompt_frames_set:
+                prompt_frame_bgrs[fi] = frm.copy()
             cv2.imwrite(os.path.join(tmp_dir, f'{fi:05d}.jpg'), frm,
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
             fi += 1
         cap.release()
+        # Clamp requested frame indices to valid range
+        prompt_frames = sorted(set(min(f, fi - 1) for f in prompt_frames))
         total_frames = fi
         print(f'[segment] {total_frames} frames  ({frame_w}x{frame_h})', flush=True)
 
@@ -402,21 +420,29 @@ def main():
         prompt_labels = None
 
         # Priority chain: --interactive > --prompt > blind 5-point grid
+        interactive_prompts = {}   # {frame_idx: (pts_array, lbls_array)}
         if args.interactive:
-            print('[segment] Interactive mode — click points on frame 0  '
-                  '(L=subject  R=background  U=undo  Enter=confirm  Esc=cancel)',
-                  flush=True)
-            pts, lbls = interactive_point_select(frame0_bgr)
-            if pts is not None:
-                use_points    = True
-                prompt_points = pts
-                prompt_labels = lbls
-                n_pos = int((lbls == 1).sum())
-                n_neg = int((lbls == 0).sum())
-                print(f'[segment] Interactive: collected {n_pos} positive + '
-                      f'{n_neg} negative point(s)', flush=True)
+            n_frames = len(prompt_frames)
+            for seq_i, pf in enumerate(prompt_frames):
+                bgr = prompt_frame_bgrs.get(pf, frame0_bgr)
+                print(f'[segment] Interactive — frame {pf}  '
+                      f'({seq_i + 1}/{n_frames})  '
+                      '(L=subject  R=background  U=undo  Enter=confirm  Esc=skip)',
+                      flush=True)
+                pts, lbls = interactive_point_select(bgr)
+                if pts is not None:
+                    interactive_prompts[pf] = (pts, lbls)
+                    n_pos = int((lbls == 1).sum())
+                    n_neg = int((lbls == 0).sum())
+                    print(f'[segment] Frame {pf}: {n_pos}+ {n_neg}- point(s) confirmed.',
+                          flush=True)
+                else:
+                    print(f'[segment] Frame {pf}: skipped.', flush=True)
+
+            if interactive_prompts:
+                use_points = True   # signals SAM2 block below to use interactive_prompts
             else:
-                print('[segment] Interactive: cancelled or no positive points — '
+                print('[segment] Interactive: all frames skipped — '
                       'falling back to 5-point grid prompt.', flush=True)
 
         elif args.prompt:
@@ -460,18 +486,31 @@ def main():
 
         import torch
         with torch.inference_mode():
-            state = predictor.init_state(video_path=tmp_dir)
+            state = predictor.init_state(video_path=tmp_dir,
+                                         offload_video_to_cpu=True,
+                                         offload_state_to_cpu=True)
 
-            if use_box:
+            if interactive_prompts:
+                # Multi-frame interactive: add each confirmed frame as a conditioning anchor
+                for pf, (pts, lbls) in sorted(interactive_prompts.items()):
+                    predictor.add_new_points_or_box(
+                        state, frame_idx=pf, obj_id=1,
+                        points=pts, labels=lbls)
+                start_fi = min(interactive_prompts.keys())
+            elif use_box:
                 predictor.add_new_points_or_box(
                     state, frame_idx=0, obj_id=1,
                     box=prompt_box)
+                start_fi = 0
             else:
+                # Grid fallback (or GDINO fallback to grid) — always frame 0
                 predictor.add_new_points_or_box(
                     state, frame_idx=0, obj_id=1,
                     points=prompt_points, labels=prompt_labels)
+                start_fi = 0
 
-            for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
+            for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(
+                    state, start_frame_idx=start_fi):
                 masks  = (mask_logits > 0.0).squeeze(1).cpu().numpy()
                 merged = masks.any(axis=0)
                 all_masks[frame_idx] = merged

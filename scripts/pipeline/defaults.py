@@ -56,7 +56,7 @@ EDGE_DIFFUSION_DEFAULTS = {
     'model_path':            'models/diffusion_edge/bsds.pt',
     'first_stage_path':      'models/diffusion_edge/first_stage_total_320.pt',
     'config_path':           'models/diffusion_edge/bsds_sample.yaml',
-    'sampling_steps':        8,
+    'sampling_steps':        1,
 }
 
 
@@ -77,13 +77,20 @@ THIN_NMS_DEFAULTS = {
     'smooth_sigma': 1.0,
     # After NMS, threshold to binary and skeletonize.
     'threshold':    0.05,
+    # Dilate the SAM2 mask by this many pixels before NMS so that the hard
+    # zero-cliff at the mask boundary doesn't contaminate gradient direction
+    # computation.  The binary result is re-intersected with the original mask
+    # afterwards.  Mirrors Steger's mask_dilate_size treatment.
+    'mask_dilate_size':  9,
+    # Post-NMS mask erosion (0 = use original mask, keeps outer boundary chains).
+    'mask_erode_kernel': 0,
 }
 
 THIN_ZHANG_SUEN_DEFAULTS = {
     'threshold': 0.0,
     # Mask handling — Zhang-Suen operates on the eroded mask (default 9px
     # erosion via _erode_mask).
-    'mask_erode_kernel': 9,
+    'mask_erode_kernel': 0,
 }
 
 # Per-edge-model Zhang-Suen overrides (populated by calibrate_stage2.py).
@@ -91,7 +98,7 @@ THIN_ZHANG_SUEN_DEFAULTS = {
 # must adapt to the noise floor and dynamic range of the incoming soft map.
 THIN_ZS_HED_OVERRIDES   = {'threshold': 0.351}   # calibrated bike frame 15
 THIN_ZS_NBED_OVERRIDES  = {'threshold': 0.437}   # calibrated bike frame 15
-THIN_ZS_DE_OVERRIDES    = {}                      # DE calibration skipped (OOM at 1080p)
+THIN_ZS_DE_OVERRIDES    = {'threshold': 0.25}     # uncalibrated; cuts DE noise floor
 THIN_ZS_CANNY_OVERRIDES = {}                      # N/A — Canny normally pairs with thin=none
 
 # Per-edge-model NMS overrides (same rationale as Zhang-Suen).
@@ -157,7 +164,7 @@ THIN_STEGER_CANNY_OVERRIDES = {}
 # "no graph traversal" baseline distinct from greedy_eulerian / iarussi.
 VEC_DP_DEFAULTS = {
     # Visvalingam-Whyatt min effective triangle area (px²).  Applied in Stage 4.
-    'simplify_area': 1.5,
+    'simplify_area': 30.0,
     'min_pts':       3,
     'min_len':       40,
     # Per-polyline intensity contrast modulator.
@@ -167,7 +174,7 @@ VEC_DP_DEFAULTS = {
 VEC_GREEDY_EULERIAN_DEFAULTS = {
     'junction_angle_deg': 30.0,
     'tangent_k':          5,
-    'simplify_area':      1.5,
+    'simplify_area':      30.0,
     'min_pts':            3,
     'min_len':            40,
     'spread':             0.5,
@@ -182,17 +189,18 @@ VEC_IARUSSI_DEFAULTS = {
     'T0':            1.0,
     'T_min':         0.01,
     'cooling':       0.995,
-    'n_proposals':   2000,
+    'n_proposals':   500,
     'kick_threshold':  300,    # rejection-streak threshold for re-heat
     'kick_temperature': 0.3,
     'kick_duration':   200,
     'early_stop_rejections': 500,
+    'max_seconds':           30,   # hard wall-clock budget; None = unlimited
     # Move mix (must sum to 1.0)
     'p_split':       0.4,
     'p_join':        0.4,
     'p_permute':     0.2,
     # Postprocess
-    'simplify_area':      1.5,
+    'simplify_area':      30.0,
     'min_pts':            3,
     'min_len':            40,
     'spread':             0.5,

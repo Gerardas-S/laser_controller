@@ -73,15 +73,19 @@ def process_frame(bgr_raw: np.ndarray,
     polyline list (outer SAM2 contour + interior polylines), spline-filtered."""
 
     # ---- Stage 0 ----
+    _t0 = time.perf_counter()
     stage0_fn = registry.PREPROCESS[stage0]
     frame = stage0_fn(bgr_raw, PREPROCESS_CLAHE_BILATERAL if stage0 == 'cb' else None)
+    _t1 = time.perf_counter()
 
     # ---- Stage 1 ----
     if pre_computed_edge is not None:
         edge_map = pre_computed_edge
+        _t2 = _t1          # cache hit — no inference time
     else:
         edge_fn = registry.EDGE[edge]
         edge_map = edge_fn(frame, mask, _EDGE_CFG[edge], device, runner_cache)
+        _t2 = time.perf_counter()
         # Stash the freshly-computed edge map so the cache-writing block in
         # run_pipeline() can write it without a second model inference.
         runner_cache['_last_edge_map'] = edge_map
@@ -90,6 +94,7 @@ def process_frame(bgr_raw: np.ndarray,
     thin_fn = registry.THIN[thin]
     graph = thin_fn(edge_map, mask, _THIN_CFG[thin],
                     edge_method=edge, bgr_frame_for_mask=bgr_raw)
+    _t3 = time.perf_counter()
 
     if debug_prefix:
         _save_thinning_debug(graph, frame_w, frame_h, edge_map, debug_prefix)
@@ -97,6 +102,7 @@ def process_frame(bgr_raw: np.ndarray,
     # ---- Stage 3 ----
     vec_fn = registry.VEC[vec]
     internal_polylines = vec_fn(graph, _VEC_CFG[vec])
+    _t4 = time.perf_counter()
 
     # ---- Stage 4 (interior) ----
     pp = dict(POSTPROCESS_DEFAULTS)
@@ -138,10 +144,20 @@ def process_frame(bgr_raw: np.ndarray,
     frame_polys = outer + interior
     if spline_samples > 1:
         frame_polys = postprocess.apply_spline_fitting(frame_polys, spline_samples)
+    _t5 = time.perf_counter()
 
     if debug_prefix:
         postprocess.render_polys_to_png(frame_polys, frame_w, frame_h,
                                           f'{debug_prefix}_07_splined.png')
+
+    # Stash per-stage timings (ms) for the progress print in run_pipeline().
+    runner_cache['_last_frame_timings'] = {
+        's0': (_t1 - _t0) * 1e3,
+        's1': (_t2 - _t1) * 1e3,
+        's2': (_t3 - _t2) * 1e3,
+        's3': (_t4 - _t3) * 1e3,
+        's4': (_t5 - _t4) * 1e3,
+    }
 
     return frame_polys
 
@@ -238,14 +254,25 @@ def run_pipeline(video_path: str,
             if em is not None:
                 writer.write(edge_detect.edgemap_to_bgr(em))
 
+        tm = runner_cache.pop('_last_frame_timings', {})
         frames_out.append(polys)
 
         if (fi + 1) % 10 == 0 or fi == total_frames - 1:
-            n_poly = len(polys)
-            n_pts  = sum(len(p['pts']) for p in polys)
+            n_poly  = len(polys)
+            n_pts   = sum(len(p['pts']) for p in polys)
             elapsed = time.perf_counter() - t_start
-            print(f'[pipeline] {fi+1}/{total_frames}  polys={n_poly}  pts={n_pts}  '
-                  f'elapsed={elapsed:.1f}s', flush=True)
+            frame_ms = sum(tm.values())
+            print(
+                f'[pipeline] {fi+1}/{total_frames}  polys={n_poly}  pts={n_pts}  '
+                f'elapsed={elapsed:.1f}s  '
+                f'last={frame_ms:.0f}ms'
+                f'  (s0={tm.get("s0",0):.0f}'
+                f'  s1={tm.get("s1",0):.0f}'
+                f'  s2={tm.get("s2",0):.0f}'
+                f'  s3={tm.get("s3",0):.0f}'
+                f'  s4={tm.get("s4",0):.0f})',
+                flush=True,
+            )
 
     cap.release()
     if cap_reader is not None:
